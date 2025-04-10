@@ -61,6 +61,12 @@ abstract class ServerMessage {
         return NewPostMessage(post: post);
       case 'error':
         return ErrorMessage(message: json['message'] as String);
+      case 'market_update':
+        return MarketUpdateMessage(
+          postId: json['post_id'] as String,
+          price: (json['price'] as num).toDouble(),
+          supply: json['supply'] as int
+        );
       // Add other cases for MarketUpdate etc. later
       default:
         print("Received unknown server message type: $type");
@@ -83,6 +89,17 @@ class NewPostMessage extends ServerMessage {
 class ErrorMessage extends ServerMessage {
   final String message;
   const ErrorMessage({required this.message});
+}
+
+class MarketUpdateMessage extends ServerMessage {
+  final String postId;
+  final double price;
+  final int supply;
+  const MarketUpdateMessage({
+    required this.postId,
+    required this.price,
+    required this.supply
+  });
 }
 
 class UnknownMessage extends ServerMessage {
@@ -234,6 +251,23 @@ class TimelineState extends ChangeNotifier {
           _posts.insert(0, message.post); // Add new post to the beginning
            print("TimelineState: Added new post ${message.post.id}.");
        }
+    } else if (message is MarketUpdateMessage) {
+        final index = _posts.indexWhere((p) => p.id == message.postId);
+        if (index != -1) {
+            // Create a new Post object with updated values
+            final originalPost = _posts[index];
+            _posts[index] = Post(
+                id: originalPost.id,
+                userId: originalPost.userId,
+                content: originalPost.content,
+                timestamp: originalPost.timestamp,
+                price: message.price, // Update price
+                supply: message.supply, // Update supply
+            );
+            print("TimelineState: Updated post ${message.postId} - Price: ${message.price}, Supply: ${message.supply}");
+        } else {
+             print("TimelineState: Received MarketUpdate for unknown post ${message.postId}");
+        }
     } else if (message is ErrorMessage) {
        print("TimelineState: Received server error: ${message.message}");
       _error = message.message; // Store the error message
@@ -749,12 +783,39 @@ class PostWidget extends StatelessWidget {
                  mainAxisAlignment: MainAxisAlignment.end,
                  children: [
                      ElevatedButton(
-                        onPressed: () { /* TODO: Implement Buy */ print("Buy pressed for ${post.id}"); },
+                        onPressed: () {
+                          // Access WebSocketService via context
+                          final wsService = Provider.of<WebSocketService>(context, listen: false);
+                          if (wsService.status == WebSocketStatus.connected) {
+                              final buyMessage = {
+                                  'type': 'buy',
+                                  'post_id': post.id
+                              };
+                              wsService.sendMessage(buyMessage);
+                          } else {
+                               ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(content: Text('Not connected'), backgroundColor: Colors.orange),
+                            );
+                          }
+                        },
                         child: const Text('Buy')
                      ),
                      const SizedBox(width: 8),
                      ElevatedButton(
-                        onPressed: () { /* TODO: Implement Sell */ print("Sell pressed for ${post.id}"); },
+                         onPressed: () {
+                            final wsService = Provider.of<WebSocketService>(context, listen: false);
+                            if (wsService.status == WebSocketStatus.connected) {
+                                final sellMessage = {
+                                    'type': 'sell',
+                                    'post_id': post.id
+                                };
+                                wsService.sendMessage(sellMessage);
+                             } else {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(content: Text('Not connected'), backgroundColor: Colors.orange),
+                            );
+                          }
+                        },
                         child: const Text('Sell')
                      ),
                  ],

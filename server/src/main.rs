@@ -51,8 +51,8 @@ type Posts = Arc<DashMap<Uuid, Post>>;   // PostID -> Post
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMessage {
     CreatePost { content: String },
-    // Buy { post_id: Uuid, amount: u64 },
-    // Sell { post_id: Uuid, amount: u64 },
+    Buy { post_id: Uuid },  // Buy 1 unit
+    Sell { post_id: Uuid }, // Sell 1 unit
 }
 
 // Represents messages sent from the server to the client
@@ -63,8 +63,8 @@ enum ServerMessage {
     InitialState { posts: Vec<Post> },
     // Broadcast when a new post is created
     NewPost { post: Post },
-    // Broadcast when price/supply changes (TODO)
-    // MarketUpdate { post_id: Uuid, price: f64, supply: i64 },
+    // Broadcast when price/supply changes
+    MarketUpdate { post_id: Uuid, price: f64, supply: i64 },
     // Error message sent to a specific client
     Error { message: String },
 }
@@ -261,8 +261,8 @@ fn message_type(msg: &ServerMessage) -> &'static str {
     match msg {
         ServerMessage::InitialState { .. } => "InitialState",
         ServerMessage::NewPost { .. } => "NewPost",
+        ServerMessage::MarketUpdate { .. } => "MarketUpdate",
         ServerMessage::Error { .. } => "Error",
-        // ServerMessage::MarketUpdate { .. } => "MarketUpdate",
     }
 }
 
@@ -310,7 +310,60 @@ async fn handle_client_message(
                         // Broadcast to all clients
                         broadcast_message(broadcast_msg, state).await;
                     }
-                    // Handle other ClientMessage types (Buy, Sell) here...
+                    ClientMessage::Buy { post_id } => {
+                        println!("Handling Buy for post_id={} from user_id={}", post_id, user_id);
+                        // Get the post mutably
+                        if let Some(mut post_entry) = state.posts.get_mut(&post_id) {
+                            // Update supply
+                            post_entry.supply += 1;
+                            // Recalculate price
+                            let new_price = get_price(post_entry.supply);
+                            post_entry.price = Some(new_price);
+                            println!(
+                                "Post {} updated: supply={}, price={}",
+                                post_id, post_entry.supply, new_price
+                            );
+                            // Prepare broadcast message
+                            let update_msg = ServerMessage::MarketUpdate {
+                                post_id,
+                                price: new_price,
+                                supply: post_entry.supply,
+                            };
+                            // Broadcast the update
+                            broadcast_message(update_msg, state).await;
+                        } else {
+                            eprintln!("Buy error: Post {} not found", post_id);
+                            // Optionally send error back to client
+                            // send_error_message(client_id, format!("Post {} not found", post_id), state).await;
+                        }
+                    }
+                    ClientMessage::Sell { post_id } => {
+                        println!("Handling Sell for post_id={} from user_id={}", post_id, user_id);
+                         // Get the post mutably
+                        if let Some(mut post_entry) = state.posts.get_mut(&post_id) {
+                            // Update supply
+                            post_entry.supply -= 1;
+                             // Recalculate price
+                            let new_price = get_price(post_entry.supply);
+                            post_entry.price = Some(new_price);
+                             println!(
+                                "Post {} updated: supply={}, price={}",
+                                post_id, post_entry.supply, new_price
+                            );
+                            // Prepare broadcast message
+                            let update_msg = ServerMessage::MarketUpdate {
+                                post_id,
+                                price: new_price,
+                                supply: post_entry.supply,
+                            };
+                            // Broadcast the update
+                            broadcast_message(update_msg, state).await;
+                        } else {
+                            eprintln!("Sell error: Post {} not found", post_id);
+                            // Optionally send error back to client
+                            // send_error_message(client_id, format!("Post {} not found", post_id), state).await;
+                        }
+                    }
                 }
             }
             Err(e) => {
