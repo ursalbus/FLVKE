@@ -58,6 +58,7 @@ type Posts = Arc<DashMap<Uuid, Post>>;             // PostID -> Post
 type UserBalances = Arc<DashMap<String, f64>>;   // UserID -> Balance
 // UserID -> PostID -> UserPositionDetail
 type UserPositions = Arc<DashMap<String, DashMap<Uuid, UserPositionDetail>>>;
+type UserRealizedPnl = Arc<DashMap<String, f64>>; // Added: UserID -> Total Realized PNL
 
 // Represents incoming messages from the client
 #[derive(Deserialize, Debug)]
@@ -85,6 +86,7 @@ enum ServerMessage {
     UserSync { 
         balance: f64,
         positions: Vec<PositionDetail>,
+        total_realized_pnl: f64, // Added
     },
     NewPost { post: Post },
     MarketUpdate { post_id: Uuid, price: f64, supply: i64 }, 
@@ -95,6 +97,7 @@ enum ServerMessage {
         average_price: f64,
         unrealized_pnl: f64,
     },
+    RealizedPnlUpdate { total_realized_pnl: f64 }, // Added
     Error { message: String },
 }
 
@@ -107,6 +110,7 @@ struct AppState {
     posts: Posts,
     user_balances: UserBalances,
     user_positions: UserPositions, // Updated type
+    user_realized_pnl: UserRealizedPnl, // Added
     jwt_secret: Arc<String>,
 }
 
@@ -260,8 +264,10 @@ async fn handle_connection(ws: WebSocket, user_id: String, state: AppState) {
     }
     println!("Sent InitialState to client_id={}", client_id);
 
-    // --- Send UserSync (Balance & Positions) ---
+    // --- Send UserSync (Balance, Positions, Realized PNL) ---
     let user_balance = *state.user_balances.entry(user_id.clone()).or_insert(INITIAL_BALANCE);
+    // Fetch realized PNL, defaulting to 0.0 if user not found
+    let total_realized_pnl = *state.user_realized_pnl.entry(user_id.clone()).or_insert(0.0);
     let user_positions_detail: Vec<PositionDetail> = state
         .user_positions
         .get(&user_id)
@@ -291,13 +297,14 @@ async fn handle_connection(ws: WebSocket, user_id: String, state: AppState) {
     let user_sync_msg = ServerMessage::UserSync {
         balance: user_balance,
         positions: user_positions_detail,
+        total_realized_pnl, // Send fetched/defaulted value
     };
      if client_sender.send(Ok(Message::text(serde_json::to_string(&user_sync_msg).unwrap()))).is_err() {
          eprintln!("Failed initial send (UserSync) to client_id={}", client_id);
          state.clients.remove(&client_id);
          return;
     }
-     println!("Sent UserSync to client_id={}", client_id);
+     println!("Sent UserSync to client_id={} (Bal: {:.4}, RPnl: {:.4})", client_id, user_balance, total_realized_pnl);
     // --------------------------
 
     let (ws_sender, mut ws_receiver) = ws.split();
@@ -430,6 +437,7 @@ fn message_type_for_debug(msg: &ServerMessage) -> &'static str {
         ServerMessage::MarketUpdate { .. } => "MarketUpdate",
         ServerMessage::BalanceUpdate { .. } => "BalanceUpdate",
         ServerMessage::PositionUpdate { .. } => "PositionUpdate",
+        ServerMessage::RealizedPnlUpdate { .. } => "RealizedPnlUpdate", // Added
         ServerMessage::Error { .. } => "Error",
     }
 }
@@ -482,34 +490,47 @@ async fn handle_client_message(
                             let user_balance = balance_entry.value_mut();
 
                             if *user_balance >= cost {
+                                // Update balance & post state first
                                 *user_balance -= cost;
                                 post.supply = new_supply;
                                 post.price = Some(new_price);
-
+                                
                                 let user_positions_for_user = state.user_positions.entry(user_id.to_string()).or_default();
                                 let mut user_position = user_positions_for_user.entry(post_id).or_insert_with(UserPositionDetail::default);
+                                
+                                let old_size = user_position.size;
                                 user_position.size += amount_to_buy;
-                                user_position.total_cost_basis += cost;
+                                user_position.total_cost_basis += cost; 
 
-                                // Calculate post-trade metrics (Avg Price only)
+                                let new_size = user_position.size;
                                 let avg_price = calculate_average_price(&user_position);
-                                let pnl = calculate_unrealized_pnl(&user_position, new_price); // Calculate PNL after trade
+                                let unrealized_pnl = calculate_unrealized_pnl(&user_position, new_price);
+
+                                // --- Realized PNL Check (Shouldn't happen when buying into a pos, but check anyway) ---
+                                if old_size != 0 && new_size == 0 { 
+                                    let realized_pnl_for_trade = -user_position.total_cost_basis; // Should be 0 if logic is right
+                                    println!("WARN: Position closed unexpectedly on BUY? RPnl: {:.4}", realized_pnl_for_trade);
+                                     // Update totals
+                                    let mut total_pnl = state.user_realized_pnl.entry(user_id.to_string()).or_insert(0.0);
+                                    *total_pnl += realized_pnl_for_trade;
+                                    *user_balance += realized_pnl_for_trade; // Add realized PNL to balance
+                                    // Reset cost basis for next position cycle
+                                    user_position.total_cost_basis = 0.0;
+                                    // Send PNL Update
+                                     send_to_client(client_id, ServerMessage::RealizedPnlUpdate { total_realized_pnl: *total_pnl }, state).await;
+                                }
+                                // ---------------------------------------------------------------------
 
                                 println!(
-                                    "-> Buy OK (Cost: {:.4}): Post {} (Supply: {}, Price: {:.4}), User {} (Pos: {}, Avg Prc: {:.4}, Bal: {:.4})",
-                                    cost, post_id, post.supply, new_price, user_id, user_position.size, avg_price, *user_balance
+                                    "-> Buy OK (Cost: {:.4}): Post {} (Supply: {}, Price: {:.4}), User {} (Pos: {}, Avg Prc: {:.4}, URPnl: {:.4}, Bal: {:.4})",
+                                    cost, post_id, post.supply, new_price, user_id, user_position.size, avg_price, unrealized_pnl, *user_balance
                                 );
 
-                                // Send updates to the user
+                                // Send updates
                                 send_to_client(client_id, ServerMessage::BalanceUpdate { balance: *user_balance }, state).await;
                                 send_to_client(client_id, ServerMessage::PositionUpdate {
-                                    post_id,
-                                    size: user_position.size,
-                                    average_price: avg_price,
-                                    unrealized_pnl: pnl, // Send updated PNL
+                                    post_id, size: new_size, average_price: avg_price, unrealized_pnl
                                  }, state).await;
-
-                                // Broadcast market update AND trigger PNL updates for OTHERS
                                 broadcast_market_and_position_updates(post_id, new_price, post.supply, client_id, state).await;
 
                             } else {
@@ -537,14 +558,12 @@ async fn handle_client_message(
                             let user_positions_for_user = state.user_positions.entry(user_id.to_string()).or_default();
                             let mut user_position = user_positions_for_user.entry(post_id).or_insert_with(UserPositionDetail::default);
 
-                            // Determine cost/proceeds based on direction
-                            let trade_cost: f64; // Cost to user (negative if receiving proceeds)
-                            if user_position.size >= amount_to_sell {
-                                // Selling existing long
-                                trade_cost = -proceeds_or_cost; // Negative cost = proceeds
-                            } else {
-                                // Opening/increasing short
-                                trade_cost = proceeds_or_cost; // Positive cost for short collateral
+                            let old_size = user_position.size;
+                            let trade_cost: f64; 
+                            if old_size >= amount_to_sell { // Selling long
+                                trade_cost = -proceeds_or_cost;
+                            } else { // Selling short
+                                trade_cost = proceeds_or_cost;
                                 if *user_balance < trade_cost {
                                     println!(
                                         "-> Sell FAIL (Short): User {} Insufficient balance ({:.4}) for collateral {:.4} (at new price {:.4})",
@@ -554,35 +573,51 @@ async fn handle_client_message(
                                     return;
                                 }
                             }
-                            // If we reach here, the trade is allowed
-
-                            *user_balance -= trade_cost; // Apply cost/proceeds
+                            
+                            // Update primary states
+                            *user_balance -= trade_cost; 
                             post.supply = new_supply;
                             post.price = Some(new_price);
+                            let cost_basis_before_trade = user_position.total_cost_basis;
                             user_position.size -= amount_to_sell;
-                            // Update cost basis: Subtract cost if long, add cost if short (double negative)
-                            user_position.total_cost_basis -= trade_cost; 
-
-                            // Calculate post-trade metrics (Avg Price only)
+                            user_position.total_cost_basis -= trade_cost; // Adjust cost basis
+                            
+                            let new_size = user_position.size;
                             let avg_price = calculate_average_price(&user_position);
-                            let pnl = calculate_unrealized_pnl(&user_position, new_price); // Calculate PNL after trade
+                            let unrealized_pnl = calculate_unrealized_pnl(&user_position, new_price);
+
+                            // --- Realized PNL Check ---                             
+                            let mut realized_pnl_for_trade = 0.0;
+                            if old_size != 0 && new_size == 0 { 
+                                // Position closed! Realized PNL = (-trade_cost) - cost_basis_before_trade
+                                // or simply -cost_basis_after_trade if size is 0
+                                realized_pnl_for_trade = -user_position.total_cost_basis;
+                                println!(
+                                    "   -> Position Closed! Realized PNL: {:.4} (Value: {:.4}, BasisBefore: {:.4})",
+                                    realized_pnl_for_trade, -trade_cost, cost_basis_before_trade
+                                );
+                                 // Update totals
+                                let mut total_pnl = state.user_realized_pnl.entry(user_id.to_string()).or_insert(0.0);
+                                *total_pnl += realized_pnl_for_trade;
+                                *user_balance += realized_pnl_for_trade; // Add realized PNL to balance
+                                // Reset cost basis for next position cycle
+                                user_position.total_cost_basis = 0.0;
+                                // Send PNL Update
+                                 send_to_client(client_id, ServerMessage::RealizedPnlUpdate { total_realized_pnl: *total_pnl }, state).await;
+                            }
+                            // --------------------------
 
                              println!(
-                                "-> Sell OK (Value: {:.4}): Post {} (Supply: {}, Price: {:.4}), User {} (Pos: {}, Avg Prc: {:.4}, Bal: {:.4})",
+                                "-> Sell OK (Value: {:.4}): Post {} (Supply: {}, Price: {:.4}), User {} (Pos: {}, Avg Prc: {:.4}, URPnl: {:.4}, Bal: {:.4}) RPnlTrade: {:.4}",
                                 -trade_cost, 
-                                post_id, post.supply, new_price, user_id, user_position.size, avg_price, *user_balance
+                                post_id, post.supply, new_price, user_id, user_position.size, avg_price, unrealized_pnl, *user_balance, realized_pnl_for_trade
                             );
 
-                            // Send updates to the user
+                            // Send updates
                             send_to_client(client_id, ServerMessage::BalanceUpdate { balance: *user_balance }, state).await;
                              send_to_client(client_id, ServerMessage::PositionUpdate {
-                                    post_id,
-                                    size: user_position.size,
-                                    average_price: avg_price,
-                                    unrealized_pnl: pnl, // Send updated PNL
+                                    post_id, size: new_size, average_price: avg_price, unrealized_pnl
                                  }, state).await;
-
-                            // Broadcast market update AND trigger PNL updates for OTHERS
                             broadcast_market_and_position_updates(post_id, new_price, post.supply, client_id, state).await;
 
                         } else {
@@ -667,6 +702,7 @@ async fn main() {
         posts: Posts::default(),
         user_balances: UserBalances::default(),
         user_positions: UserPositions::default(), // Uses updated type alias
+        user_realized_pnl: UserRealizedPnl::default(), // Added init
         jwt_secret: Arc::new(jwt_secret),
     };
 

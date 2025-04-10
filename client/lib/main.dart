@@ -87,6 +87,7 @@ abstract class ServerMessage {
             .toList();
         return UserSyncMessage(
             balance: (json['balance'] as num).toDouble(),
+            total_realized_pnl: (json['total_realized_pnl'] as num? ?? 0.0).toDouble(),
             positions: positionsList,
         );
       case 'new_post':
@@ -103,6 +104,10 @@ abstract class ServerMessage {
       case 'position_update':
         return PositionUpdateMessage(
           position: PositionDetail.fromJson(json as Map<String, dynamic>)
+        );
+      case 'realized_pnl_update':
+        return RealizedPnlUpdateMessage(
+          totalRealizedPnl: (json['total_realized_pnl'] as num).toDouble()
         );
       case 'error':
         return ErrorMessage(message: json['message'] as String);
@@ -151,8 +156,14 @@ class PositionUpdateMessage extends ServerMessage {
 
 class UserSyncMessage extends ServerMessage {
   final double balance;
+  final double total_realized_pnl;
   final List<PositionDetail> positions;
-  const UserSyncMessage({required this.balance, required this.positions});
+  const UserSyncMessage({required this.balance, required this.total_realized_pnl, required this.positions});
+}
+
+class RealizedPnlUpdateMessage extends ServerMessage {
+  final double totalRealizedPnl;
+  const RealizedPnlUpdateMessage({required this.totalRealizedPnl});
 }
 
 class UnknownMessage extends ServerMessage {
@@ -423,22 +434,50 @@ class AuthState extends ChangeNotifier {
 // Added BalanceState
 class BalanceState extends ChangeNotifier {
    double _balance = 1000.0; // Default initial balance
+   double _totalRealizedPnl = 0.0; // Added
    String? _error;
 
    double get balance => _balance;
+   double get totalRealizedPnl => _totalRealizedPnl; // Added getter
    String? get error => _error;
 
    void handleServerMessage(ServerMessage message) {
      print("BalanceState handling: ${message.runtimeType}");
-     if (message is BalanceUpdateMessage) {
-        _balance = message.balance;
-        _error = null;
-        print("BalanceState updated: ${_balance.toStringAsFixed(4)}");
-        notifyListeners();
+     bool changed = false;
+     if (message is UserSyncMessage) { // Handle initial sync
+       if (_balance != message.balance) {
+           _balance = message.balance;
+           changed = true;
+       }
+       if (_totalRealizedPnl != message.total_realized_pnl) {
+            _totalRealizedPnl = message.total_realized_pnl;
+            changed = true;
+       }
+        print("BalanceState Synced: Bal: ${_balance.toStringAsFixed(4)}, RPnl: ${_totalRealizedPnl.toStringAsFixed(4)}");
+     } else if (message is BalanceUpdateMessage) {
+        if (_balance != message.balance) {
+            _balance = message.balance;
+            _error = null;
+             print("BalanceState updated: Bal: ${_balance.toStringAsFixed(4)}");
+            changed = true;
+        }
+     } else if (message is RealizedPnlUpdateMessage) { // Added
+         if (_totalRealizedPnl != message.totalRealizedPnl) {
+            _totalRealizedPnl = message.totalRealizedPnl;
+            _error = null;
+            print("BalanceState updated: RPnl: ${_totalRealizedPnl.toStringAsFixed(4)}");
+            changed = true;
+         }
      } else if (message is ErrorMessage) {
-        // Optionally handle errors related to balance if server sends specific ones
-         _error = message.message;
-          print("BalanceState received error: ${message.message}");
+         // Optionally handle errors related to balance if server sends specific ones
+          if (_error != message.message) {
+               _error = message.message;
+               print("BalanceState received error: ${message.message}");
+               changed = true;
+          }
+     }
+
+     if (changed) {
          notifyListeners();
      }
    }
@@ -785,21 +824,48 @@ class _TimelinePageState extends State<TimelinePage> {
     // Consume BalanceState to display balance
     final balanceState = Provider.of<BalanceState>(context);
 
+    // Format currency
+    final balanceFormatted = NumberFormat.currency(symbol: '\$', decimalDigits: 2).format(balanceState.balance);
+    final rpnlFormatted = NumberFormat.currency(symbol: '\$', decimalDigits: 2).format(balanceState.totalRealizedPnl);
+    final rpnlColor = balanceState.totalRealizedPnl >= 0 ? Colors.green[700] : Colors.red[700];
+
     return Scaffold(
       appBar: AppBar(
-        // Display Balance in AppBar Title
         title: Text(
-          'Timeline (WS: ${wsStatus.name}) - Bal: \$${balanceState.balance.toStringAsFixed(2)}',
-          style: const TextStyle(fontSize: 16), // Adjust font size if needed
+          // Example: Bal: $1000.00 | RPnl: $50.00 (WS: connected)
+          'Bal: $balanceFormatted | RPnl: ', 
+          style: const TextStyle(fontSize: 14), 
         ),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.logout),
-            onPressed: () async {
-               await authState.signOut();
-            },
-          ),
-        ],
+         titleSpacing: 0, // Reduce spacing if title is long
+         actions: [
+             // Display RPnl colored
+             Padding(
+               padding: const EdgeInsets.only(right: 4.0), // Add padding if needed
+               child: Center(
+                 child: Text(
+                    rpnlFormatted,
+                    style: TextStyle(fontSize: 14, color: rpnlColor, fontWeight: FontWeight.bold)
+                 ),
+               ),
+             ),
+             // Separator
+             const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 4.0),
+                child: Text('|', style: TextStyle(fontSize: 14)),
+             ),
+             // WS Status
+             Padding(
+               padding: const EdgeInsets.only(right: 4.0),
+               child: Center(child: Text('WS: ${wsStatus.name}', style: const TextStyle(fontSize: 14))), 
+             ),
+            // Logout Button
+           IconButton(
+             icon: const Icon(Icons.logout),
+             onPressed: () async {
+                await authState.signOut();
+             },
+           ),
+         ],
       ),
       body: Column( // Main body structure
         children: [
