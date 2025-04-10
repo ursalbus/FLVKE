@@ -501,7 +501,8 @@ async fn handle_client_message(
                                     let avg_price_before = calculate_average_price(&user_position);
                                     realized_pnl_for_trade = (avg_price_before - execution_price) * (reduction_amount as f64);
                                     let basis_removed = avg_price_before * (reduction_amount as f64);
-                                     user_position.total_cost_basis -= basis_removed; 
+                                     // Add back the basis (negated proceeds) associated with the covered portion
+                                     user_position.total_cost_basis += basis_removed; 
                                 }
                             }
 
@@ -512,18 +513,16 @@ async fn handle_client_message(
                                 post.supply = new_supply;
                                 post.price = Some(execution_price);
                                 user_position.size += amount_to_buy;
-                                // Add cost basis ONLY if opening/increasing long position
+                                
+                                // Add cost basis ONLY if INCREASING the magnitude of a LONG position
+                                // (i.e., old_size was >= 0)
                                 if old_size >= 0 { 
                                      user_position.total_cost_basis += trade_value; 
-                                } else {
-                                     // If covering short and potentially flipping long, only basis_removed was applied.
-                                     // If size becomes 0 after this, basis should also be 0.
-                                     if user_position.size == 0 {
-                                         user_position.total_cost_basis = 0.0;
-                                     }
                                 }
+                                // NOTE: No cost basis change here if old_size < 0 (covering short) 
+                                // because basis_removed already handled it.
                                 
-                                // --- Handle Realized PNL --- 
+                                // --- Handle Realized PNL & Potential Basis Reset --- 
                                 let mut total_pnl_updated = false;
                                 if realized_pnl_for_trade != 0.0 {
                                     println!(
@@ -534,12 +533,13 @@ async fn handle_client_message(
                                     *total_pnl += realized_pnl_for_trade;
                                     *user_balance += realized_pnl_for_trade; // Add realized PNL to balance
                                     total_pnl_updated = true;
-                                    // Reset basis if position is now flat
-                                    if user_position.size == 0 {
-                                        user_position.total_cost_basis = 0.0;
-                                    }
                                 }
-
+                                
+                                // ALWAYS check if position is now flat and reset basis if so
+                                if user_position.size == 0 {
+                                     println!("   -> Position size is 0 after trade, resetting basis.");
+                                     user_position.total_cost_basis = 0.0;
+                                 }
                                 // --- Calculate Post-Trade State --- 
                                 let new_size = user_position.size;
                                 let avg_price = calculate_average_price(&user_position);
