@@ -1,33 +1,39 @@
-# Flutter
-build/
-.dart_tool/
-.flutter-plugins
-.flutter-plugins-dependencies
-.packages
-.pub-cache/
-ios/Pods/
-ios/.symlinks/
-ios/Flutter/App.framework
-ios/Flutter/Flutter.framework
-ios/Flutter/Generated.xcconfig
-ios/Runner/GeneratedPluginRegistrant.*
+# Environment variables
+.env
 
-# Android
-android/.gradle/
-android/app/build/
-android/app/.cxx/
-android/gradlew
-android/gradlew.bat
-android/local.properties
-android/key.properties
-*.iml
-*.ipr
-*.iws
+# OS specific
+.DS_Store
+
+# IDE specific
+.vscode/
+.idea/
+
+# Flutter
+client/build/
+client/.dart_tool/
+client/.flutter-plugins
+client/.flutter-plugins-dependencies
+client/.packages
+client/ios/Flutter/App.framework
+client/ios/Flutter/Generated.xcconfig
+client/ios/Flutter/flutter_export_environment.sh
+client/ios/Runner/GeneratedPluginRegistrant.*
+client/ios/Runner.xcworkspace/xcshareddata/WorkspaceSettings.xcsettings
+client/ios/.generated/
+client/ios/Pods/
+client/ios/Podfile.lock
+client/android/.gradle/
+client/android/app/build/
+client/android/build/
+client/android/.idea/
+client/android/gradle.properties # Often contains sensitive keys
+client/android/local.properties # Contains SDK path
+client/linux/flutter/ephemeral/
+client/macos/Flutter/ephemeral/
+client/windows/flutter/ephemeral/
+client/web/build/
+client/.metadata
 
 # Rust
-target/
-Cargo.lock
-
-# Supabase / Environment
-.env
-supabase/functions/_temp/ 
+server/target/
+# server/Cargo.lock # Optional: Often committed, uncomment if you prefer not to commit it 
