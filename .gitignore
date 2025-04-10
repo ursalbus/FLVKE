@@ -1,0 +1,33 @@
+# Flutter
+build/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+ios/Pods/
+ios/.symlinks/
+ios/Flutter/App.framework
+ios/Flutter/Flutter.framework
+ios/Flutter/Generated.xcconfig
+ios/Runner/GeneratedPluginRegistrant.*
+
+# Android
+android/.gradle/
+android/app/build/
+android/app/.cxx/
+android/gradlew
+android/gradlew.bat
+android/local.properties
+android/key.properties
+*.iml
+*.ipr
+*.iws
+
+# Rust
+target/
+Cargo.lock
+
+# Supabase / Environment
+.env
+supabase/functions/_temp/ 
