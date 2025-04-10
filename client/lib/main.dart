@@ -43,6 +43,31 @@ class Post {
   }
 }
 
+// Added PositionDetail class (matching server)
+@immutable
+class PositionDetail {
+  final String postId;
+  final int size;
+  final double averagePrice;
+  final double unrealizedPnl;
+
+  const PositionDetail({
+    required this.postId,
+    required this.size,
+    required this.averagePrice,
+    required this.unrealizedPnl,
+  });
+
+  factory PositionDetail.fromJson(Map<String, dynamic> json) {
+    return PositionDetail(
+      postId: json['post_id'] as String,
+      size: json['size'] as int,
+      averagePrice: (json['average_price'] as num).toDouble(),
+      unrealizedPnl: (json['unrealized_pnl'] as num).toDouble(),
+    );
+  }
+}
+
 // Represents messages received from the server
 @immutable
 abstract class ServerMessage {
@@ -56,24 +81,34 @@ abstract class ServerMessage {
             .map((postJson) => Post.fromJson(postJson as Map<String, dynamic>))
             .toList();
         return InitialStateMessage(posts: postsList);
+      case 'user_sync':
+        final positionsList = (json['positions'] as List)
+            .map((posJson) => PositionDetail.fromJson(posJson as Map<String, dynamic>))
+            .toList();
+        return UserSyncMessage(
+            balance: (json['balance'] as num).toDouble(),
+            positions: positionsList,
+        );
       case 'new_post':
         final post = Post.fromJson(json['post'] as Map<String, dynamic>);
         return NewPostMessage(post: post);
-      case 'balance_update':
-        return BalanceUpdateMessage(balance: (json['balance'] as num).toDouble());
-      case 'error':
-        return ErrorMessage(message: json['message'] as String);
       case 'market_update':
         return MarketUpdateMessage(
           postId: json['post_id'] as String,
           price: (json['price'] as num).toDouble(),
           supply: json['supply'] as int
         );
-      // Add other cases for MarketUpdate etc. later
+      case 'balance_update':
+        return BalanceUpdateMessage(balance: (json['balance'] as num).toDouble());
+      case 'position_update':
+        return PositionUpdateMessage(
+          position: PositionDetail.fromJson(json as Map<String, dynamic>)
+        );
+      case 'error':
+        return ErrorMessage(message: json['message'] as String);
       default:
         print("Received unknown server message type: $type");
-        // Return a specific unknown type or throw an error
-         return UnknownMessage(type: type, data: json);
+        return UnknownMessage(type: type, data: json);
     }
   }
 }
@@ -107,6 +142,17 @@ class MarketUpdateMessage extends ServerMessage {
 class BalanceUpdateMessage extends ServerMessage {
   final double balance;
   const BalanceUpdateMessage({required this.balance});
+}
+
+class PositionUpdateMessage extends ServerMessage {
+  final PositionDetail position;
+  const PositionUpdateMessage({required this.position});
+}
+
+class UserSyncMessage extends ServerMessage {
+  final double balance;
+  final List<PositionDetail> positions;
+  const UserSyncMessage({required this.balance, required this.positions});
 }
 
 class UnknownMessage extends ServerMessage {
@@ -398,6 +444,34 @@ class BalanceState extends ChangeNotifier {
    }
 }
 
+// Added PositionState
+class PositionState extends ChangeNotifier {
+  Map<String, PositionDetail> _positions = {}; // PostID -> PositionDetail
+  String? _error;
+
+  Map<String, PositionDetail> get positions => _positions;
+  String? get error => _error;
+
+  void handleServerMessage(ServerMessage message) {
+    print("PositionState handling: ${message.runtimeType}");
+    _error = null;
+    if (message is UserSyncMessage) {
+       _positions = { for (var p in message.positions) p.postId : p };
+        print("PositionState: Synced ${_positions.length} positions.");
+        notifyListeners();
+    } else if (message is PositionUpdateMessage) {
+       _positions[message.position.postId] = message.position;
+        print("PositionState: Updated position for ${message.position.postId}");
+        notifyListeners();
+    } else if (message is ErrorMessage) {
+       _error = message.message;
+        print("PositionState received error: ${message.message}");
+       notifyListeners();
+    }
+     // Add logic here if positions should be removed when size is 0?
+  }
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
@@ -412,24 +486,28 @@ Future<void> main() async {
       providers: [
         ChangeNotifierProvider(create: (_) => AuthState()),
         ChangeNotifierProvider(create: (_) => TimelineState()),
-        ChangeNotifierProvider(create: (_) => BalanceState()), // Provide BalanceState
-        // Provide WebSocketService, passing handlers from TimelineState & BalanceState
-        ChangeNotifierProxyProvider2<TimelineState, BalanceState, WebSocketService>(
+        ChangeNotifierProvider(create: (_) => BalanceState()),
+        ChangeNotifierProvider(create: (_) => PositionState()), // Provide PositionState
+        // Update ProxyProvider to include PositionState
+        ChangeNotifierProxyProvider3<TimelineState, BalanceState, PositionState, WebSocketService>(
            create: (context) {
               final timelineState = context.read<TimelineState>();
               final balanceState = context.read<BalanceState>();
+              final positionState = context.read<PositionState>(); // Read PositionState
               print("ProxyProvider creating initial WebSocketService with handlers");
               return WebSocketService(onMessageReceivedHandlers: [
                   timelineState.handleServerMessage,
                   balanceState.handleServerMessage,
+                  positionState.handleServerMessage, // Add handler
               ]);
            },
-           update: (context, timelineState, balanceState, previousWebSocketService) {
+           update: (context, timelineState, balanceState, positionState, previousWebSocketService) {
               print("ProxyProvider updating WebSocketService... Reusing previous: ${previousWebSocketService != null}");
-              // Reuse previous instance, handlers don't need update in this simple case
+              // Reuse previous instance
               return previousWebSocketService ?? WebSocketService(onMessageReceivedHandlers: [
                  timelineState.handleServerMessage,
                  balanceState.handleServerMessage,
+                 positionState.handleServerMessage, // Add handler
               ]);
             },
          ),
@@ -795,6 +873,10 @@ class PostWidget extends StatelessWidget {
      final formattedDate = DateFormat.yMd().add_jms().format(post.timestamp.toLocal());
      final formattedPrice = NumberFormat.currency(symbol: '\$', decimalDigits: 2).format(post.price);
 
+     // Consume PositionState to get user's position details for *this* post
+     final positionState = Provider.of<PositionState>(context);
+     final positionDetail = positionState.positions[post.id];
+
     return Card(
       margin: const EdgeInsets.symmetric(vertical: 8.0, horizontal: 12.0),
       elevation: 2,
@@ -821,6 +903,9 @@ class PostWidget extends StatelessWidget {
                ]
             ),
              const SizedBox(height: 8),
+             // Display Position Info if it exists
+             if (positionDetail != null && positionDetail.size != 0)
+                _buildPositionInfo(context, positionDetail),
             // Action Buttons
              Row(
                  mainAxisAlignment: MainAxisAlignment.end,
@@ -866,6 +951,53 @@ class PostWidget extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+
+  // Helper widget to display position details
+  Widget _buildPositionInfo(BuildContext context, PositionDetail detail) {
+      final avgPriceFormatted = NumberFormat.currency(symbol: '\$', decimalDigits: 4).format(detail.averagePrice);
+      
+      // Use PNL directly from the detail object (sent by server)
+      final pnlFormatted = NumberFormat.currency(symbol: '\$', decimalDigits: 2).format(detail.unrealizedPnl);
+      final pnlColor = detail.unrealizedPnl >= 0 ? Colors.green[700] : Colors.red[700];
+
+      return Container(
+          padding: const EdgeInsets.symmetric(vertical: 8.0, horizontal: 4.0),
+          margin: const EdgeInsets.only(bottom: 8.0),
+          decoration: BoxDecoration(
+              border: Border.all(color: Colors.blueGrey.shade100),
+              borderRadius: BorderRadius.circular(4.0),
+              color: Colors.grey[50],
+          ),
+          child: Column(
+             crossAxisAlignment: CrossAxisAlignment.start,
+             children: [
+                 Text(
+                     'Your Position:', 
+                     style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.bold)
+                 ),
+                 const SizedBox(height: 4),
+                 Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                        Text('Size: ${detail.size}'),
+                        Text('Avg Price: $avgPriceFormatted'),
+                    ],
+                 ),
+                 const SizedBox(height: 4),
+                 // Display PNL directly
+                  Row(
+                     mainAxisAlignment: MainAxisAlignment.end, // Align PNL to the right
+                     children: [
+                         Text(
+                             'Unrealized PNL: $pnlFormatted',
+                             style: TextStyle(color: pnlColor, fontWeight: FontWeight.bold),
+                         ),
+                     ],
+                 ),
+             ],
+          ),
     );
   }
 }
