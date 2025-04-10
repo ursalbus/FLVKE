@@ -59,6 +59,8 @@ abstract class ServerMessage {
       case 'new_post':
         final post = Post.fromJson(json['post'] as Map<String, dynamic>);
         return NewPostMessage(post: post);
+      case 'balance_update':
+        return BalanceUpdateMessage(balance: (json['balance'] as num).toDouble());
       case 'error':
         return ErrorMessage(message: json['message'] as String);
       case 'market_update':
@@ -102,6 +104,11 @@ class MarketUpdateMessage extends ServerMessage {
   });
 }
 
+class BalanceUpdateMessage extends ServerMessage {
+  final double balance;
+  const BalanceUpdateMessage({required this.balance});
+}
+
 class UnknownMessage extends ServerMessage {
    final String type;
    final Map<String, dynamic> data;
@@ -117,14 +124,15 @@ class WebSocketService extends ChangeNotifier {
   WebSocketChannel? _channel;
   WebSocketStatus _status = WebSocketStatus.disconnected;
   String? _connectionError;
-  final Function(ServerMessage) _onMessageReceived; // Callback
+  // Use a list of handlers now
+  final List<Function(ServerMessage)> _messageHandlers;
 
   WebSocketStatus get status => _status;
   String? get connectionError => _connectionError;
 
-  // Constructor now requires a callback function
-  WebSocketService({required Function(ServerMessage) onMessageReceived})
-      : _onMessageReceived = onMessageReceived;
+   // Constructor takes a list of handlers
+  WebSocketService({required List<Function(ServerMessage)> onMessageReceivedHandlers})
+      : _messageHandlers = onMessageReceivedHandlers;
 
   Future<void> connect(String accessToken) async {
     if (_status == WebSocketStatus.connected || _status == WebSocketStatus.connecting) {
@@ -151,12 +159,16 @@ class WebSocketService extends ChangeNotifier {
             final decodedJson = jsonDecode(message as String) as Map<String, dynamic>;
             final serverMessage = ServerMessage.fromJson(decodedJson);
              print('Decoded ServerMessage: ${serverMessage.runtimeType}');
-            // Call the callback function provided by TimelineState
-            _onMessageReceived(serverMessage);
+            // Call all registered handlers
+            for (final handler in _messageHandlers) {
+                handler(serverMessage);
+            }
           } catch (e, stackTrace) {
             print("Error decoding/handling server message: $e\n$stackTrace");
             // Optionally notify TimelineState about the error
-             _onMessageReceived(ErrorMessage(message: "Failed to parse server message: $e"));
+             for (final handler in _messageHandlers) {
+                handler(ErrorMessage(message: "Failed to parse server message: $e"));
+             }
           }
         },
         onDone: () {
@@ -362,6 +374,30 @@ class AuthState extends ChangeNotifier {
   }
 }
 
+// Added BalanceState
+class BalanceState extends ChangeNotifier {
+   double _balance = 1000.0; // Default initial balance
+   String? _error;
+
+   double get balance => _balance;
+   String? get error => _error;
+
+   void handleServerMessage(ServerMessage message) {
+     print("BalanceState handling: ${message.runtimeType}");
+     if (message is BalanceUpdateMessage) {
+        _balance = message.balance;
+        _error = null;
+        print("BalanceState updated: ${_balance.toStringAsFixed(4)}");
+        notifyListeners();
+     } else if (message is ErrorMessage) {
+        // Optionally handle errors related to balance if server sends specific ones
+         _error = message.message;
+          print("BalanceState received error: ${message.message}");
+         notifyListeners();
+     }
+   }
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
@@ -376,22 +412,25 @@ Future<void> main() async {
       providers: [
         ChangeNotifierProvider(create: (_) => AuthState()),
         ChangeNotifierProvider(create: (_) => TimelineState()),
-        ChangeNotifierProxyProvider<TimelineState, WebSocketService>(
+        ChangeNotifierProvider(create: (_) => BalanceState()), // Provide BalanceState
+        // Provide WebSocketService, passing handlers from TimelineState & BalanceState
+        ChangeNotifierProxyProvider2<TimelineState, BalanceState, WebSocketService>(
            create: (context) {
-               // Initial creation - get the handler from TimelineState
-               final timelineState = context.read<TimelineState>();
-               print("ProxyProvider creating initial WebSocketService");
-               return WebSocketService(onMessageReceived: timelineState.handleServerMessage);
+              final timelineState = context.read<TimelineState>();
+              final balanceState = context.read<BalanceState>();
+              print("ProxyProvider creating initial WebSocketService with handlers");
+              return WebSocketService(onMessageReceivedHandlers: [
+                  timelineState.handleServerMessage,
+                  balanceState.handleServerMessage,
+              ]);
            },
-           update: (context, timelineState, previousWebSocketService) {
-              // IMPORTANT: Reuse the previous instance if it exists!
-              // Only update the callback if necessary (though in this setup, the handler itself doesn't change)
+           update: (context, timelineState, balanceState, previousWebSocketService) {
               print("ProxyProvider updating WebSocketService... Reusing previous: ${previousWebSocketService != null}");
-              // In this specific case, the handler function reference passed to the constructor
-              // IS the same instance throughout the lifecycle of TimelineState,
-              // so we don't strictly need to update anything here.
-              // We just return the existing service to prevent disposal.
-              return previousWebSocketService ?? WebSocketService(onMessageReceived: timelineState.handleServerMessage);
+              // Reuse previous instance, handlers don't need update in this simple case
+              return previousWebSocketService ?? WebSocketService(onMessageReceivedHandlers: [
+                 timelineState.handleServerMessage,
+                 balanceState.handleServerMessage,
+              ]);
             },
          ),
       ],
@@ -664,13 +703,17 @@ class _TimelinePageState extends State<TimelinePage> {
   @override
   Widget build(BuildContext context) {
     final authState = Provider.of<AuthState>(context, listen: false);
-    // Use a Consumer for wsStatus if AppBar title needs to react,
-    // or rely on the setState in _onWebSocketStatusChanged as currently implemented.
     final wsStatus = _webSocketService.status;
+    // Consume BalanceState to display balance
+    final balanceState = Provider.of<BalanceState>(context);
 
     return Scaffold(
       appBar: AppBar(
-        title: Text('Timeline (WS: ${wsStatus.name})'), // Shows connection status
+        // Display Balance in AppBar Title
+        title: Text(
+          'Timeline (WS: ${wsStatus.name}) - Bal: \$${balanceState.balance.toStringAsFixed(2)}',
+          style: const TextStyle(fontSize: 16), // Adjust font size if needed
+        ),
         actions: [
           IconButton(
             icon: const Icon(Icons.logout),

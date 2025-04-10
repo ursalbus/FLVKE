@@ -5,13 +5,16 @@ use futures_util::StreamExt;
 use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
 use serde::{Deserialize, Serialize};
 use std::{convert::Infallible, env, sync::Arc};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, UnboundedSender};
 use uuid::Uuid;
 use warp::{
     filters::ws::{Message, WebSocket},
     http::StatusCode,
     Filter, Rejection, Reply,
 };
+
+// --- Constants ---
+const INITIAL_BALANCE: f64 = 1000.0;
 
 // --- Types ---
 
@@ -39,12 +42,15 @@ struct Post {
 #[derive(Debug)]
 struct Client {
     user_id: String,
-    sender: mpsc::UnboundedSender<Result<Message, warp::Error>>,
+    sender: UnboundedSender<Result<Message, warp::Error>>,
 }
 
 // Type aliases for shared state
-type Clients = Arc<DashMap<Uuid, Client>>; // ClientID -> Client
-type Posts = Arc<DashMap<Uuid, Post>>;   // PostID -> Post
+type Clients = Arc<DashMap<Uuid, Client>>;         // ClientID -> Client
+type Posts = Arc<DashMap<Uuid, Post>>;             // PostID -> Post
+type UserBalances = Arc<DashMap<String, f64>>;   // UserID -> Balance
+// UserID -> PostID -> Position (Supply held by user)
+type UserPositions = Arc<DashMap<String, DashMap<Uuid, i64>>>;
 
 // Represents incoming messages from the client
 #[derive(Deserialize, Debug)]
@@ -56,17 +62,14 @@ enum ClientMessage {
 }
 
 // Represents messages sent from the server to the client
-#[derive(Serialize, Debug, Clone)] // Clone needed for broadcasting
+#[derive(Serialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMessage {
-    // Initial state sent on connection
     InitialState { posts: Vec<Post> },
-    // Broadcast when a new post is created
     NewPost { post: Post },
-    // Broadcast when price/supply changes
     MarketUpdate { post_id: Uuid, price: f64, supply: i64 },
-    // Error message sent to a specific client
-    Error { message: String },
+    BalanceUpdate { balance: f64 }, // Added: Sent only to specific client
+    Error { message: String },     // Can be broadcast or specific
 }
 
 
@@ -76,6 +79,8 @@ enum ServerMessage {
 struct AppState {
     clients: Clients,
     posts: Posts,
+    user_balances: UserBalances,   // Added
+    user_positions: UserPositions, // Added
     jwt_secret: Arc<String>,
 }
 
@@ -136,6 +141,38 @@ fn with_auth(
 }
 
 // --- WebSocket Handling ---
+
+// Helper to send a message to a specific client
+async fn send_to_client(client_id: Uuid, message: ServerMessage, state: &AppState) {
+    if let Some(client) = state.clients.get(&client_id) {
+        match serde_json::to_string(&message) {
+            Ok(json_msg) => {
+                if client.sender.send(Ok(Message::text(json_msg))).is_err() {
+                    // Error sending means channel is likely closed, client will be removed soon
+                    eprintln!(
+                        "Error queueing message type '{:?}' for client_id={}",
+                        message_type_for_debug(&message),
+                        client_id
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "Failed to serialize direct message '{:?}' for client_id={}: {}",
+                     message_type_for_debug(&message),
+                     client_id, e
+                );
+            }
+        }
+    } else {
+        // This might happen if client disconnected between message generation and sending
+         eprintln!(
+            "Attempted to send direct message '{:?}' to non-existent client_id={}",
+            message_type_for_debug(&message),
+            client_id
+        );
+    }
+}
 
 async fn handle_connection(ws: WebSocket, user_id: String, state: AppState) {
     let client_id = Uuid::new_v4();
@@ -240,7 +277,7 @@ async fn broadcast_message(message: ServerMessage, state: &AppState) {
 
     println!(
         "Broadcasting message type: {} to {} clients",
-        message_type(&message),
+        message_type_for_debug(&message),
         state.clients.len()
     );
 
@@ -256,12 +293,13 @@ async fn broadcast_message(message: ServerMessage, state: &AppState) {
     }
 }
 
-// Helper to get message type for logging
-fn message_type(msg: &ServerMessage) -> &'static str {
-    match msg {
+// Helper to get simple message type string for logging
+fn message_type_for_debug(msg: &ServerMessage) -> &'static str {
+     match msg {
         ServerMessage::InitialState { .. } => "InitialState",
         ServerMessage::NewPost { .. } => "NewPost",
         ServerMessage::MarketUpdate { .. } => "MarketUpdate",
+        ServerMessage::BalanceUpdate { .. } => "BalanceUpdate", // Added
         ServerMessage::Error { .. } => "Error",
     }
 }
@@ -273,126 +311,173 @@ async fn handle_client_message(
     state: &AppState,
 ) {
     if let Ok(text) = msg.to_str() {
-        println!(
-            "Received text: client_id={}, user_id={}: {}",
-            client_id, user_id, text
-        );
-
         match serde_json::from_str::<ClientMessage>(text) {
             Ok(client_msg) => {
-                println!("Deserialized: {:?}", client_msg);
+                 println!(
+                    "User {} ({}) request: {:?}",
+                    user_id, client_id, client_msg
+                );
 
                 match client_msg {
                     ClientMessage::CreatePost { content } => {
-                        println!("Handling CreatePost from user_id={}: {}", user_id, content);
-
-                        // Create the new post
+                        // --- Create Post Logic (Mostly unchanged) ---
                         let new_post_id = Uuid::new_v4();
-                        let mut new_post = Post {
+                        let initial_price = get_price(0);
+                        let new_post = Post {
                             id: new_post_id,
                             user_id: user_id.to_string(),
                             content,
                             timestamp: Utc::now(),
                             supply: 0,
-                            price: None, // Price will be calculated before sending
+                            price: Some(initial_price), // Store initial price
                         };
-
-                        // Store the post
                         state.posts.insert(new_post_id, new_post.clone());
-                        println!("Post {} created and stored.", new_post_id);
-
-                         // Calculate price for broadcast
-                        new_post.price = Some(get_price(new_post.supply));
-
-                        // Prepare the broadcast message
+                        println!(
+                            "-> Post {} created (Price: {:.4}, Supply: 0)",
+                            new_post_id, initial_price
+                        );
+                        // No need to recalculate price before broadcast here
                         let broadcast_msg = ServerMessage::NewPost { post: new_post };
-
-                        // Broadcast to all clients
                         broadcast_message(broadcast_msg, state).await;
                     }
                     ClientMessage::Buy { post_id } => {
-                        println!("Handling Buy for post_id={} from user_id={}", post_id, user_id);
-                        // Get the post mutably
+                        // --- Buy Logic (Price based on AFTER trade) ---
                         if let Some(mut post_entry) = state.posts.get_mut(&post_id) {
-                            // Update supply
-                            post_entry.supply += 1;
-                            // Recalculate price
-                            let new_price = get_price(post_entry.supply);
-                            post_entry.price = Some(new_price);
-                            println!(
-                                "Post {} updated: supply={}, price={}",
-                                post_id, post_entry.supply, new_price
-                            );
-                            // Prepare broadcast message
-                            let update_msg = ServerMessage::MarketUpdate {
-                                post_id,
-                                price: new_price,
-                                supply: post_entry.supply,
-                            };
-                            // Broadcast the update
-                            broadcast_message(update_msg, state).await;
+                            let post = &mut *post_entry;
+                            let amount_to_buy: i64 = 1;
+                            
+                            // Calculate state *after* the potential trade
+                            let new_supply = post.supply + amount_to_buy;
+                            let new_price = get_price(new_supply);
+                            let cost = new_price * (amount_to_buy as f64);
+
+                            // Get user balance, initialize if first trade
+                            let mut balance_entry = state.user_balances.entry(user_id.to_string()).or_insert(INITIAL_BALANCE);
+                            let user_balance = balance_entry.value_mut();
+
+                            if *user_balance >= cost {
+                                // Sufficient balance
+                                *user_balance -= cost;
+
+                                // Update post supply and price *now* that trade is confirmed
+                                post.supply = new_supply;
+                                post.price = Some(new_price);
+
+                                // Update user position
+                                let user_positions_for_user = state.user_positions.entry(user_id.to_string()).or_default();
+                                let mut user_position = user_positions_for_user.entry(post_id).or_insert(0);
+                                *user_position += amount_to_buy;
+
+                                println!(
+                                    "-> Buy OK (Cost: {:.4}): Post {} (Supply: {}, Price: {:.4}), User {} (Pos: {}, Bal: {:.4})",
+                                    cost, post_id, post.supply, new_price, user_id, *user_position, *user_balance
+                                );
+
+                                // Send balance update to buyer
+                                send_to_client(client_id, ServerMessage::BalanceUpdate { balance: *user_balance }, state).await;
+
+                                // Broadcast market update
+                                let update_msg = ServerMessage::MarketUpdate {
+                                    post_id,
+                                    price: new_price,
+                                    supply: post.supply,
+                                };
+                                broadcast_message(update_msg, state).await;
+
+                            } else {
+                                // Insufficient balance
+                                 println!(
+                                    "-> Buy FAIL: User {} Insufficient balance ({:.4}) for cost {:.4} (at new price {:.4})",
+                                     user_id, *user_balance, cost, new_price
+                                );
+                                send_to_client(client_id, ServerMessage::Error { message: format!("Insufficient balance ({:.4}) to buy at cost {:.4} (price would become {:.4})", *user_balance, cost, new_price) }, state).await;
+                            }
                         } else {
-                            eprintln!("Buy error: Post {} not found", post_id);
-                            // Optionally send error back to client
-                            // send_error_message(client_id, format!("Post {} not found", post_id), state).await;
+                             println!("-> Buy FAIL: Post {} not found", post_id);
+                            send_to_client(client_id, ServerMessage::Error { message: format!("Post {} not found", post_id) }, state).await;
                         }
                     }
                     ClientMessage::Sell { post_id } => {
-                        println!("Handling Sell for post_id={} from user_id={}", post_id, user_id);
-                         // Get the post mutably
-                        if let Some(mut post_entry) = state.posts.get_mut(&post_id) {
-                            // Update supply
-                            post_entry.supply -= 1;
-                             // Recalculate price
-                            let new_price = get_price(post_entry.supply);
-                            post_entry.price = Some(new_price);
+                        // --- Sell Logic (Price based on AFTER trade) ---
+                         if let Some(mut post_entry) = state.posts.get_mut(&post_id) {
+                            let post = &mut *post_entry;
+                            let amount_to_sell: i64 = 1;
+
+                            // Calculate state *after* the potential trade
+                            let new_supply = post.supply - amount_to_sell;
+                            let new_price = get_price(new_supply);
+                            let proceeds_or_cost = new_price * (amount_to_sell as f64);
+
+                            // Get user balance, initialize if needed
+                            let mut balance_entry = state.user_balances.entry(user_id.to_string()).or_insert(INITIAL_BALANCE);
+                            let user_balance = balance_entry.value_mut();
+
+                             // Get user position for this post, initialize if needed
+                             let user_positions_for_user = state.user_positions.entry(user_id.to_string()).or_default();
+                             let mut user_position = user_positions_for_user.entry(post_id).or_insert(0);
+
+                            // Check if user HAS position to sell if going long, or balance if going short
+                            if *user_position >= amount_to_sell {
+                                // Selling existing long position - Increase balance by proceeds
+                                *user_balance += proceeds_or_cost;
+                            } else { 
+                                // Selling to open/increase short position - Check balance for cost
+                                let short_cost = proceeds_or_cost;
+                                if *user_balance < short_cost {
+                                     println!(
+                                        "-> Sell FAIL (Short): User {} Insufficient balance ({:.4}) for collateral {:.4} (at new price {:.4})",
+                                        user_id, *user_balance, short_cost, new_price
+                                    );
+                                    send_to_client(client_id, ServerMessage::Error { message: format!("Insufficient balance ({:.4}) to cover short collateral {:.4} (price would become {:.4})", *user_balance, short_cost, new_price) }, state).await;
+                                    return; // Stop processing this message
+                                }
+                                // Sufficient balance to cover short - Decrease balance by cost
+                                *user_balance -= short_cost;
+                            }
+                            // If we reach here, the trade is allowed
+
+                            // Update post supply and price *now*
+                            post.supply = new_supply;
+                            post.price = Some(new_price);
+
+                            // Update user position
+                            *user_position -= amount_to_sell;
+
                              println!(
-                                "Post {} updated: supply={}, price={}",
-                                post_id, post_entry.supply, new_price
+                                "-> Sell OK (Value: {:.4}): Post {} (Supply: {}, Price: {:.4}), User {} (Pos: {}, Bal: {:.4})",
+                                proceeds_or_cost, post_id, post.supply, new_price, user_id, *user_position, *user_balance
                             );
-                            // Prepare broadcast message
+
+                            // Send balance update to seller
+                            send_to_client(client_id, ServerMessage::BalanceUpdate { balance: *user_balance }, state).await;
+
+                            // Broadcast market update
                             let update_msg = ServerMessage::MarketUpdate {
                                 post_id,
                                 price: new_price,
-                                supply: post_entry.supply,
+                                supply: post.supply,
                             };
-                            // Broadcast the update
                             broadcast_message(update_msg, state).await;
+
                         } else {
-                            eprintln!("Sell error: Post {} not found", post_id);
-                            // Optionally send error back to client
-                            // send_error_message(client_id, format!("Post {} not found", post_id), state).await;
+                            println!("-> Sell FAIL: Post {} not found", post_id);
+                            send_to_client(client_id, ServerMessage::Error { message: format!("Post {} not found", post_id) }, state).await;
                         }
                     }
                 }
             }
             Err(e) => {
-                eprintln!(
-                    "Deserialize error: client_id={}, user_id={}, msg=\"{}\", err={}",
-                    client_id, user_id, text, e
-                );
-                // Send error back to the specific client
-                if let Some(client) = state.clients.get(&client_id) {
-                    let error_msg = ServerMessage::Error {
-                        message: format!("Invalid message format: {}", e),
-                    };
-                    if let Ok(json_msg) = serde_json::to_string(&error_msg) {
-                        if client.sender.send(Ok(Message::text(json_msg))).is_err() {
-                            eprintln!(
-                                "Failed to send error reply to client_id={}",
-                                client_id
-                            );
-                        }
-                    }
-                }
+                 eprintln!("Deserialize error for client_id={}: {}, err={}", client_id, text, e);
+                 // Use the helper function to send error to specific client
+                 send_to_client(client_id, ServerMessage::Error { message: format!("Invalid message format: {}", e) }, state).await;
             }
         }
     } else if msg.is_ping() {
-        println!("Received ping: client_id={}, user_id={}", client_id, user_id);
+        // Ping/Pong handled automatically by Warp
     } else if msg.is_close() {
-        println!("Received close frame: client_id={}, user_id={}", client_id, user_id);
+        // Close frame handled by the loop exiting in handle_connection
     } else {
-         println!("Received non-text: client_id={}, user_id={}", client_id, user_id);
+        // Ignore binary messages etc.
     }
 }
 
@@ -454,6 +539,8 @@ async fn main() {
     let app_state = AppState {
         clients: Clients::default(),
         posts: Posts::default(), // Initialize empty posts map
+        user_balances: UserBalances::default(), // Added init
+        user_positions: UserPositions::default(), // Added init
         jwt_secret: Arc::new(jwt_secret),
     };
 
