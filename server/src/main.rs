@@ -481,64 +481,93 @@ async fn handle_client_message(
                     ClientMessage::Buy { post_id } => {
                         if let Some(mut post_entry) = state.posts.get_mut(&post_id) {
                             let post = &mut *post_entry;
-                            let amount_to_buy: i64 = 1;
+                            let amount_to_buy: i64 = 1; // Positive for buy
                             let new_supply = post.supply + amount_to_buy;
-                            let new_price = get_price(new_supply);
-                            let cost = new_price * (amount_to_buy as f64);
+                            let execution_price = get_price(new_supply);
+                            let trade_value = execution_price * (amount_to_buy as f64);
 
                             let mut balance_entry = state.user_balances.entry(user_id.to_string()).or_insert(INITIAL_BALANCE);
                             let user_balance = balance_entry.value_mut();
+                            let user_positions_for_user = state.user_positions.entry(user_id.to_string()).or_default();
+                            let mut user_position = user_positions_for_user.entry(post_id).or_insert_with(UserPositionDetail::default);
 
-                            if *user_balance >= cost {
-                                // Update balance & post state first
-                                *user_balance -= cost;
+                            let old_size = user_position.size;
+                            let mut realized_pnl_for_trade = 0.0;
+
+                            // Check if reducing a short position
+                            if old_size < 0 {
+                                let reduction_amount = std::cmp::min(amount_to_buy, old_size.abs());
+                                if reduction_amount > 0 {
+                                    let avg_price_before = calculate_average_price(&user_position);
+                                    realized_pnl_for_trade = (avg_price_before - execution_price) * (reduction_amount as f64);
+                                    let basis_removed = avg_price_before * (reduction_amount as f64);
+                                     user_position.total_cost_basis -= basis_removed; 
+                                }
+                            }
+
+                            // Check balance 
+                            if *user_balance >= trade_value { 
+                                // --- Execute Trade --- 
+                                *user_balance -= trade_value;
                                 post.supply = new_supply;
-                                post.price = Some(new_price);
-                                
-                                let user_positions_for_user = state.user_positions.entry(user_id.to_string()).or_default();
-                                let mut user_position = user_positions_for_user.entry(post_id).or_insert_with(UserPositionDetail::default);
-                                
-                                let old_size = user_position.size;
+                                post.price = Some(execution_price);
                                 user_position.size += amount_to_buy;
-                                user_position.total_cost_basis += cost; 
-
-                                let new_size = user_position.size;
-                                let avg_price = calculate_average_price(&user_position);
-                                let unrealized_pnl = calculate_unrealized_pnl(&user_position, new_price);
-
-                                // --- Realized PNL Check (Shouldn't happen when buying into a pos, but check anyway) ---
-                                if old_size != 0 && new_size == 0 { 
-                                    let realized_pnl_for_trade = -user_position.total_cost_basis; // Should be 0 if logic is right
-                                    println!("WARN: Position closed unexpectedly on BUY? RPnl: {:.4}", realized_pnl_for_trade);
-                                     // Update totals
+                                // Add cost basis ONLY if opening/increasing long position
+                                if old_size >= 0 { 
+                                     user_position.total_cost_basis += trade_value; 
+                                } else {
+                                     // If covering short and potentially flipping long, only basis_removed was applied.
+                                     // If size becomes 0 after this, basis should also be 0.
+                                     if user_position.size == 0 {
+                                         user_position.total_cost_basis = 0.0;
+                                     }
+                                }
+                                
+                                // --- Handle Realized PNL --- 
+                                let mut total_pnl_updated = false;
+                                if realized_pnl_for_trade != 0.0 {
+                                    println!(
+                                        "   -> Realizing PNL (Buy Cover): {:.4} for User {}",
+                                        realized_pnl_for_trade, user_id
+                                    );
                                     let mut total_pnl = state.user_realized_pnl.entry(user_id.to_string()).or_insert(0.0);
                                     *total_pnl += realized_pnl_for_trade;
                                     *user_balance += realized_pnl_for_trade; // Add realized PNL to balance
-                                    // Reset cost basis for next position cycle
-                                    user_position.total_cost_basis = 0.0;
-                                    // Send PNL Update
-                                     send_to_client(client_id, ServerMessage::RealizedPnlUpdate { total_realized_pnl: *total_pnl }, state).await;
+                                    total_pnl_updated = true;
+                                    // Reset basis if position is now flat
+                                    if user_position.size == 0 {
+                                        user_position.total_cost_basis = 0.0;
+                                    }
                                 }
-                                // ---------------------------------------------------------------------
+
+                                // --- Calculate Post-Trade State --- 
+                                let new_size = user_position.size;
+                                let avg_price = calculate_average_price(&user_position);
+                                let unrealized_pnl = calculate_unrealized_pnl(&user_position, execution_price);
 
                                 println!(
-                                    "-> Buy OK (Cost: {:.4}): Post {} (Supply: {}, Price: {:.4}), User {} (Pos: {}, Avg Prc: {:.4}, URPnl: {:.4}, Bal: {:.4})",
-                                    cost, post_id, post.supply, new_price, user_id, user_position.size, avg_price, unrealized_pnl, *user_balance
+                                    "-> Buy OK (Cost: {:.4}): Post {} (Supply: {}, Price: {:.4}), User {} (Pos: {}, Avg Prc: {:.4}, URPnl: {:.4}, Bal: {:.4}) RPnlTrade: {:.4}",
+                                    trade_value, post_id, post.supply, execution_price, user_id, new_size, avg_price, unrealized_pnl, *user_balance, realized_pnl_for_trade
                                 );
 
-                                // Send updates
+                                // --- Send Updates --- 
                                 send_to_client(client_id, ServerMessage::BalanceUpdate { balance: *user_balance }, state).await;
+                                if total_pnl_updated { // Send RPnl update only if it changed
+                                     // Use map_or to get value or default
+                                     let final_total_pnl = state.user_realized_pnl.get(user_id).map_or(0.0, |v| *v.value());
+                                     send_to_client(client_id, ServerMessage::RealizedPnlUpdate { total_realized_pnl: final_total_pnl }, state).await;
+                                }
                                 send_to_client(client_id, ServerMessage::PositionUpdate {
                                     post_id, size: new_size, average_price: avg_price, unrealized_pnl
                                  }, state).await;
-                                broadcast_market_and_position_updates(post_id, new_price, post.supply, client_id, state).await;
+                                broadcast_market_and_position_updates(post_id, execution_price, post.supply, client_id, state).await;
 
                             } else {
                                 println!(
                                     "-> Buy FAIL: User {} Insufficient balance ({:.4}) for cost {:.4} (at new price {:.4})",
-                                     user_id, *user_balance, cost, new_price
+                                     user_id, *user_balance, trade_value, execution_price
                                 );
-                                send_to_client(client_id, ServerMessage::Error { message: format!("Insufficient balance ({:.4}) to buy at cost {:.4} (price would become {:.4})", *user_balance, cost, new_price) }, state).await;
+                                send_to_client(client_id, ServerMessage::Error { message: format!("Insufficient balance ({:.4}) to buy at cost {:.4} (price would become {:.4})", *user_balance, trade_value, execution_price) }, state).await;
                             }
                         } else {
                             println!("-> Buy FAIL: Post {} not found", post_id);
@@ -548,10 +577,10 @@ async fn handle_client_message(
                     ClientMessage::Sell { post_id } => {
                         if let Some(mut post_entry) = state.posts.get_mut(&post_id) {
                             let post = &mut *post_entry;
-                            let amount_to_sell: i64 = 1;
+                            let amount_to_sell: i64 = 1; // Positive for sell amount
                             let new_supply = post.supply - amount_to_sell;
-                            let new_price = get_price(new_supply);
-                            let proceeds_or_cost = new_price * (amount_to_sell as f64);
+                            let execution_price = get_price(new_supply);
+                            let trade_value = execution_price * (amount_to_sell as f64); // Proceeds if selling long, Cost if opening short
 
                             let mut balance_entry = state.user_balances.entry(user_id.to_string()).or_insert(INITIAL_BALANCE);
                             let user_balance = balance_entry.value_mut();
@@ -559,66 +588,86 @@ async fn handle_client_message(
                             let mut user_position = user_positions_for_user.entry(post_id).or_insert_with(UserPositionDetail::default);
 
                             let old_size = user_position.size;
-                            let trade_cost: f64; 
-                            if old_size >= amount_to_sell { // Selling long
-                                trade_cost = -proceeds_or_cost;
-                            } else { // Selling short
-                                trade_cost = proceeds_or_cost;
-                                if *user_balance < trade_cost {
+                            let mut realized_pnl_for_trade = 0.0;
+
+                            // Check if reducing a long position
+                            if old_size > 0 {
+                                let reduction_amount = std::cmp::min(amount_to_sell, old_size);
+                                 if reduction_amount > 0 {
+                                    let avg_price_before = calculate_average_price(&user_position);
+                                    realized_pnl_for_trade = (execution_price - avg_price_before) * (reduction_amount as f64);
+                                    let basis_removed = avg_price_before * (reduction_amount as f64);
+                                    user_position.total_cost_basis -= basis_removed; 
+                                }
+                            }
+
+                            // Check balance ONLY if opening/increasing short
+                            if old_size <= 0 { // If currently flat or short
+                                if *user_balance < trade_value {
                                     println!(
                                         "-> Sell FAIL (Short): User {} Insufficient balance ({:.4}) for collateral {:.4} (at new price {:.4})",
-                                        user_id, *user_balance, trade_cost, new_price
+                                        user_id, *user_balance, trade_value, execution_price
                                     );
-                                    send_to_client(client_id, ServerMessage::Error { message: format!("Insufficient balance ({:.4}) to cover short collateral {:.4} (price would become {:.4})", *user_balance, trade_cost, new_price) }, state).await;
+                                    send_to_client(client_id, ServerMessage::Error { message: format!("Insufficient balance ({:.4}) to cover short collateral {:.4} (price would become {:.4})", *user_balance, trade_value, execution_price) }, state).await;
                                     return;
                                 }
                             }
                             
-                            // Update primary states
-                            *user_balance -= trade_cost; 
+                            // --- Execute Trade --- 
+                            *user_balance += trade_value; 
                             post.supply = new_supply;
-                            post.price = Some(new_price);
-                            let cost_basis_before_trade = user_position.total_cost_basis;
+                            post.price = Some(execution_price);
                             user_position.size -= amount_to_sell;
-                            user_position.total_cost_basis -= trade_cost; // Adjust cost basis
+                             // Add cost basis (negative proceeds) ONLY if opening/increasing short position
+                            if old_size <= 0 {
+                                user_position.total_cost_basis -= trade_value; // Add negative proceeds (cost) 
+                            } else {
+                                 // If selling long and potentially flipping short, only basis_removed was applied.
+                                 // If size becomes 0 after this, basis should also be 0.
+                                 if user_position.size == 0 {
+                                     user_position.total_cost_basis = 0.0;
+                                 }
+                            }
                             
-                            let new_size = user_position.size;
-                            let avg_price = calculate_average_price(&user_position);
-                            let unrealized_pnl = calculate_unrealized_pnl(&user_position, new_price);
-
-                            // --- Realized PNL Check ---                             
-                            let mut realized_pnl_for_trade = 0.0;
-                            if old_size != 0 && new_size == 0 { 
-                                // Position closed! Realized PNL = (-trade_cost) - cost_basis_before_trade
-                                // or simply -cost_basis_after_trade if size is 0
-                                realized_pnl_for_trade = -user_position.total_cost_basis;
+                             // --- Handle Realized PNL --- 
+                             let mut total_pnl_updated = false;
+                            if realized_pnl_for_trade != 0.0 {
                                 println!(
-                                    "   -> Position Closed! Realized PNL: {:.4} (Value: {:.4}, BasisBefore: {:.4})",
-                                    realized_pnl_for_trade, -trade_cost, cost_basis_before_trade
+                                    "   -> Realizing PNL (Sell Long): {:.4} for User {}",
+                                    realized_pnl_for_trade, user_id
                                 );
-                                 // Update totals
                                 let mut total_pnl = state.user_realized_pnl.entry(user_id.to_string()).or_insert(0.0);
                                 *total_pnl += realized_pnl_for_trade;
                                 *user_balance += realized_pnl_for_trade; // Add realized PNL to balance
-                                // Reset cost basis for next position cycle
-                                user_position.total_cost_basis = 0.0;
-                                // Send PNL Update
-                                 send_to_client(client_id, ServerMessage::RealizedPnlUpdate { total_realized_pnl: *total_pnl }, state).await;
+                                total_pnl_updated = true;
+                                // Reset basis if position is now flat
+                                if user_position.size == 0 {
+                                    user_position.total_cost_basis = 0.0;
+                                }
                             }
-                            // --------------------------
+
+                             // --- Calculate Post-Trade State --- 
+                            let new_size = user_position.size;
+                            let avg_price = calculate_average_price(&user_position);
+                            let unrealized_pnl = calculate_unrealized_pnl(&user_position, execution_price);
 
                              println!(
                                 "-> Sell OK (Value: {:.4}): Post {} (Supply: {}, Price: {:.4}), User {} (Pos: {}, Avg Prc: {:.4}, URPnl: {:.4}, Bal: {:.4}) RPnlTrade: {:.4}",
-                                -trade_cost, 
-                                post_id, post.supply, new_price, user_id, user_position.size, avg_price, unrealized_pnl, *user_balance, realized_pnl_for_trade
+                                trade_value, 
+                                post_id, post.supply, execution_price, user_id, new_size, avg_price, unrealized_pnl, *user_balance, realized_pnl_for_trade
                             );
 
-                            // Send updates
+                            // --- Send Updates --- 
                             send_to_client(client_id, ServerMessage::BalanceUpdate { balance: *user_balance }, state).await;
+                            if total_pnl_updated { // Send RPnl update only if it changed
+                                // Use map_or to get value or default
+                                let final_total_pnl = state.user_realized_pnl.get(user_id).map_or(0.0, |v| *v.value());
+                                send_to_client(client_id, ServerMessage::RealizedPnlUpdate { total_realized_pnl: final_total_pnl }, state).await;
+                            }
                              send_to_client(client_id, ServerMessage::PositionUpdate {
                                     post_id, size: new_size, average_price: avg_price, unrealized_pnl
                                  }, state).await;
-                            broadcast_market_and_position_updates(post_id, new_price, post.supply, client_id, state).await;
+                            broadcast_market_and_position_updates(post_id, execution_price, post.supply, client_id, state).await;
 
                         } else {
                             println!("-> Sell FAIL: Post {} not found", post_id);
