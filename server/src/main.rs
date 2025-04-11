@@ -584,21 +584,36 @@ async fn handle_client_message(
                             if old_size < -EPSILON {
                                 let reduction_amount = quantity.min(old_size.abs());
                                 if reduction_amount > EPSILON {
-                                    // Use the average price calculated BEFORE the trade updates basis/size
-                                    let avg_price_before_trade = calculate_average_price(&user_position); 
-                                    
-                                    // We use the average cost of *this specific buy* to cover the short
-                                    let avg_cost_of_buy = trade_cost / quantity; // Avg price for this specific buy
-                                    
-                                    // PNL = (Short Avg Price Before Trade - Avg Buy Cost for this reduction) * reduction_amount
-                                    realized_pnl_for_trade = (avg_price_before_trade - avg_cost_of_buy) * reduction_amount;
+                                    // ---- CORRECTED PNL Calculation ----
+                                    // Calculate the average entry price of the short position being covered
+                                    // Basis is negative for shorts, so this should be positive.
+                                    let avg_short_entry_price = if old_size.abs() > EPSILON {
+                                        user_position.total_cost_basis / old_size // (neg / neg = pos)
+                                    } else {
+                                        0.0 // Should not happen if old_size < -EPSILON
+                                    };
+
+                                    // Calculate the exact cost ONLY for the part closing the short position
+                                    let exact_cost_for_reduction = calculate_cost(current_supply, current_supply + reduction_amount);
+
+                                    // Calculate the average buy cost specifically for this closing part
+                                    let avg_cost_of_buy = if reduction_amount.abs() > EPSILON {
+                                         exact_cost_for_reduction / reduction_amount
+                                     } else {
+                                         0.0 // Avoid division by zero
+                                     };
+                                    // ---- End Correction ----
+                                     
+                                    // PNL = (Avg Short Entry Price - Avg Buy Cost for this reduction) * reduction_amount
+                                    realized_pnl_for_trade = (avg_short_entry_price - avg_cost_of_buy) * reduction_amount;
 
                                     // Basis adjustment: Add back the proportional average cost basis of the covered short amount
-                                     let basis_change = avg_price_before_trade * reduction_amount;
-                                     user_position.total_cost_basis += basis_change; // <-- CORRECTED: Add the avg basis value
+                                    // Cost basis becomes less negative (moves towards zero)
+                                    let basis_change = avg_short_entry_price * reduction_amount;
+                                    user_position.total_cost_basis += basis_change; 
                                      println!(
-                                        "   -> Covering short: Reduction: {:.6}, Avg Short Prc (Calc Before): {:.6}, Avg Buy Cost: {:.6}, Basis Change: +{:.6}, Pnl: {:.6}",
-                                        reduction_amount, avg_price_before_trade, avg_cost_of_buy, basis_change, realized_pnl_for_trade
+                                        "   -> Covering short: Reduction: {:.6}, Avg Short Entry Prc: {:.6}, Avg Buy Cost (Reduction Only): {:.6}, Basis Change: +{:.6}, Pnl: {:.6}",
+                                        reduction_amount, avg_short_entry_price, avg_cost_of_buy, basis_change, realized_pnl_for_trade
                                      );
                                 }
                             }
@@ -614,9 +629,24 @@ async fn handle_client_message(
                                 
                                 // Add cost basis ONLY if establishing/increasing a LONG position
                                 if old_size >= -EPSILON { // If was flat or long
+                                     // In this case, the entire trade contributes to the long basis
                                      user_position.total_cost_basis += trade_cost;
+                                     println!("   -> Adding Long Basis (Flat/Long Start): Cost: {:.6}, Total Basis: {:.6}", 
+                                             trade_cost, user_position.total_cost_basis);
                                 }
-                                // NOTE: If covering short (old_size < -epsilon), basis adjustment was handled above.
+                                // NOTE: If covering short (old_size < -EPSILON), the basis adjustment for the *short part* was handled above.
+                                // BUT, if the buy ALSO opens a long (quantity > old_size.abs()), add the cost for that part.
+                                else if old_size < -EPSILON && quantity > old_size.abs() { 
+                                    let long_opening_quantity = quantity - old_size.abs();
+                                    // Cost for this part: Integral from 0 to (new_supply)
+                                    // new_supply here is the final supply after the full buy, which equals long_opening_quantity
+                                    let cost_for_long_part = calculate_cost(0.0, long_opening_quantity); 
+
+                                    // Add this cost to the basis (which should be near zero after the short cover adjustment)
+                                    user_position.total_cost_basis += cost_for_long_part;
+                                    println!("   -> Adding Long Basis (Short Cover + Open Long): Qty: {:.6}, Cost for Long Part: {:.6}, Total Basis: {:.6}",
+                                            long_opening_quantity, cost_for_long_part, user_position.total_cost_basis);
+                                }
 
                                 
                                 // --- Handle Realized PNL & Potential Basis Reset --- 
@@ -722,13 +752,24 @@ async fn handle_client_message(
                                 if reduction_amount > EPSILON {
                                     let avg_price_before = calculate_average_price(&user_position);
                                      // PNL = (Avg Sell Proceeds for this reduction - Avg Buy Cost) * reduction_amount
-                                     let avg_proceeds_of_sell = trade_proceeds / quantity;
+                                     
+                                     // ---- CORRECTED PNL Calculation ----
+                                     // Calculate the exact proceeds ONLY for the part closing the long position
+                                     let exact_proceeds_for_reduction = calculate_cost(current_supply - reduction_amount, current_supply);
+                                     // Calculate the average sell price specifically for this closing part
+                                     let avg_proceeds_of_sell = if reduction_amount.abs() > EPSILON {
+                                         exact_proceeds_for_reduction / reduction_amount
+                                     } else {
+                                         0.0 // Avoid division by zero if reduction_amount is tiny
+                                     };
+                                     // ---- End Correction ----
+                                     
                                     realized_pnl_for_trade = (avg_proceeds_of_sell - avg_price_before) * reduction_amount;
 
                                     // Remove the proportional cost basis associated with the sold long position
                                     let basis_removed = avg_price_before * reduction_amount;
                                     user_position.total_cost_basis -= basis_removed; 
-                                     println!("   -> Selling long: Reduction: {:.6}, Avg Buy Prc: {:.6}, Avg Sell Prc: {:.6}, Basis Removed: {:.6}, Pnl: {:.6}",
+                                     println!("   -> Selling long: Reduction: {:.6}, Avg Buy Prc: {:.6}, Avg Sell Prc (Reduction Only): {:.6}, Basis Removed: {:.6}, Pnl: {:.6}",
                                         reduction_amount, avg_price_before, avg_proceeds_of_sell, basis_removed, realized_pnl_for_trade);
                                 }
                             }
@@ -756,8 +797,22 @@ async fn handle_client_message(
 
                              // Adjust cost basis
                             if old_size <= EPSILON { // If was flat or opening/increasing SHORT position
-                                // Basis becomes more negative by the proceeds received.
-                                user_position.total_cost_basis -= trade_proceeds;
+                                // ---- CORRECTED Basis Adjustment for Shorting ----
+                                // Calculate the proceeds ONLY for the part of the quantity that opens/increases the short.
+                                let shorting_quantity = if old_size < -EPSILON { // Already short, increasing short
+                                    quantity 
+                                } else { // Was flat (old_size ~ 0), opening short
+                                    quantity 
+                                };
+                                // Proceeds for this part: Integral from (current_supply - shorting_quantity) to current_supply
+                                // This should match `trade_proceeds` if the user started flat/short.
+                                let proceeds_for_shorting_part = calculate_cost(new_supply, new_supply + shorting_quantity);
+
+                                // Basis becomes more negative by the proceeds received for the shorting part.
+                                user_position.total_cost_basis -= proceeds_for_shorting_part;
+                                println!("   -> Opening/Increasing Short: Qty: {:.6}, Proceeds for Short Part: {:.6}, Basis Change: {:.6}",
+                                        shorting_quantity, proceeds_for_shorting_part, -proceeds_for_shorting_part);
+                                // ---- End Correction ----
 
                                 // If opening the short (flat before), store the entry price
                                 /*
@@ -773,9 +828,27 @@ async fn handle_client_message(
 
                             } else { // Was reducing long position
                                 // Basis adjustment for reducing long was handled earlier
+                                // BUT, if the sell ALSO opens a short (quantity > old_size):
+                                if quantity > old_size { 
+                                    let shorting_quantity = quantity - old_size; // The part that opens the short
+
+                                    // ---- CORRECTED Basis for Opening Short ----
+                                    // Calculate proceeds for the actual supply change that opened the short.
+                                    // The long position (size old_size) finished selling when the supply reached (current_supply - old_size).
+                                    let supply_at_zero_crossing = current_supply - old_size; // Supply when user became flat
+                                    let proceeds_for_shorting_part = calculate_cost(new_supply, supply_at_zero_crossing);
+                                    // ---- End Correction ----
+
+                                    // Basis becomes negative by these proceeds.
+                                    // Note: total_cost_basis should be ~0 after the long part was removed.
+                                    user_position.total_cost_basis -= proceeds_for_shorting_part;
+                                    println!("   -> Opened Short (from Long): Qty: {:.6}, Proceeds for Short Part (Supply {:.6} -> {:.6}): {:.6}, Basis Change: {:.6}",
+                                            shorting_quantity, supply_at_zero_crossing, new_supply, proceeds_for_shorting_part, -proceeds_for_shorting_part);
+                                }
+
                                 if user_position.size.abs() < EPSILON { 
                                      user_position.total_cost_basis = 0.0;
-                                     // user_position.entry_average_price = 0.0; // <-- REMOVE
+                                    // user_position.entry_average_price = 0.0; // <-- REMOVE
                                 }
                             }
                             
