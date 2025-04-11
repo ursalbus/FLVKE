@@ -17,7 +17,7 @@ class Post {
   final String content;
   final DateTime timestamp;
   final double price; // Server calculates and includes this
-  final int supply;
+  final double supply; // <-- Changed to double
 
   const Post({
     required this.id,
@@ -38,7 +38,7 @@ class Post {
       timestamp: DateTime.parse(json['timestamp'] as String),
       // Server ensures price is sent
       price: (json['price'] as num).toDouble(),
-      supply: json['supply'] as int,
+      supply: (json['supply'] as num).toDouble(), // <-- Parse as num -> double
     );
   }
 }
@@ -47,7 +47,7 @@ class Post {
 @immutable
 class PositionDetail {
   final String postId;
-  final int size;
+  final double size; // <-- Changed to double
   final double averagePrice;
   final double unrealizedPnl;
 
@@ -61,7 +61,7 @@ class PositionDetail {
   factory PositionDetail.fromJson(Map<String, dynamic> json) {
     return PositionDetail(
       postId: json['post_id'] as String,
-      size: json['size'] as int,
+      size: (json['size'] as num).toDouble(), // <-- Parse as num -> double
       averagePrice: (json['average_price'] as num).toDouble(),
       unrealizedPnl: (json['unrealized_pnl'] as num).toDouble(),
     );
@@ -97,7 +97,7 @@ abstract class ServerMessage {
         return MarketUpdateMessage(
           postId: json['post_id'] as String,
           price: (json['price'] as num).toDouble(),
-          supply: json['supply'] as int
+          supply: (json['supply'] as num).toDouble() // <-- Parse as num -> double
         );
       case 'balance_update':
         return BalanceUpdateMessage(balance: (json['balance'] as num).toDouble());
@@ -136,7 +136,7 @@ class ErrorMessage extends ServerMessage {
 class MarketUpdateMessage extends ServerMessage {
   final String postId;
   final double price;
-  final int supply;
+  final double supply; // <-- Changed to double
   const MarketUpdateMessage({
     required this.postId,
     required this.price,
@@ -928,20 +928,73 @@ class _TimelinePageState extends State<TimelinePage> {
 // --- Custom Widgets ---
 
 // Widget to display a single post
-class PostWidget extends StatelessWidget {
+class PostWidget extends StatefulWidget { // <-- Changed to StatefulWidget
   final Post post;
 
   const PostWidget({required this.post, super.key});
 
   @override
+  State<PostWidget> createState() => _PostWidgetState();
+}
+
+class _PostWidgetState extends State<PostWidget> { // <-- Added State class
+  final _quantityController = TextEditingController(text: '1.0'); // Default to 1.0
+  final _quantityFocusNode = FocusNode();
+
+  @override
+  void dispose() {
+    _quantityController.dispose();
+    _quantityFocusNode.dispose();
+    super.dispose();
+  }
+
+  // Helper function to parse quantity and handle errors
+  double? _parseQuantity() {
+    final quantityText = _quantityController.text.trim();
+    final quantity = double.tryParse(quantityText);
+    if (quantity == null || quantity <= 0) {
+       ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Invalid quantity: $quantityText. Must be a positive number.'), backgroundColor: Colors.red),
+      );
+      return null;
+    }
+    return quantity;
+  }
+
+   // Helper function to send buy/sell message
+  void _sendTradeMessage(String type) {
+      final quantity = _parseQuantity();
+      if (quantity == null) return; // Error already shown
+
+      final wsService = Provider.of<WebSocketService>(context, listen: false);
+      if (wsService.status == WebSocketStatus.connected) {
+          final message = {
+              'type': type, // 'buy' or 'sell'
+              'post_id': widget.post.id,
+              'quantity': quantity,
+          };
+          wsService.sendMessage(message);
+          // Optionally clear or reset quantity after sending
+          // _quantityController.text = '1.0';
+          _quantityFocusNode.unfocus(); // Hide keyboard
+      } else {
+            ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Not connected'), backgroundColor: Colors.orange),
+        );
+      }
+  }
+
+
+  @override
   Widget build(BuildContext context) {
      // Formatting for display
-     final formattedDate = DateFormat.yMd().add_jms().format(post.timestamp.toLocal());
-     final formattedPrice = NumberFormat.currency(symbol: '\$', decimalDigits: 2).format(post.price);
+     final formattedDate = DateFormat.yMd().add_jms().format(widget.post.timestamp.toLocal());
+     final formattedPrice = NumberFormat.currency(symbol: '\$', decimalDigits: 4).format(widget.post.price); // Show more precision for price
+     final formattedSupply = widget.post.supply.toStringAsFixed(4); // Show precision for supply
 
      // Consume PositionState to get user's position details for *this* post
      final positionState = Provider.of<PositionState>(context);
-     final positionDetail = positionState.positions[post.id];
+     final positionDetail = positionState.positions[widget.post.id];
 
     return Card(
       margin: const EdgeInsets.symmetric(vertical: 8.0, horizontal: 12.0),
@@ -952,11 +1005,11 @@ class PostWidget extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             // Post Content
-            Text(post.content, style: Theme.of(context).textTheme.bodyMedium),
+            Text(widget.post.content, style: Theme.of(context).textTheme.bodyMedium),
             const SizedBox(height: 8),
             // Author and Timestamp
             Text(
-              'By: ${post.userId} \nAt: $formattedDate', // Consider fetching/displaying usernames later
+              'By: ${widget.post.userId} \nAt: $formattedDate', // Consider fetching/displaying usernames later
               style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.grey[600]),
             ),
             const Divider(height: 16, thickness: 1),
@@ -965,54 +1018,53 @@ class PostWidget extends StatelessWidget {
                mainAxisAlignment: MainAxisAlignment.spaceBetween,
                children: [
                   Text('Price: $formattedPrice', style: Theme.of(context).textTheme.titleMedium),
-                  Text('Supply: ${post.supply}', style: Theme.of(context).textTheme.bodyMedium),
+                  Text('Supply: $formattedSupply', style: Theme.of(context).textTheme.bodyMedium),
                ]
             ),
              const SizedBox(height: 8),
              // Display Position Info if it exists
-             if (positionDetail != null && positionDetail.size != 0)
+             if (positionDetail != null && positionDetail.size.abs() > 1e-9) // Use epsilon for double comparison
                 _buildPositionInfo(context, positionDetail),
-            // Action Buttons
-             Row(
-                 mainAxisAlignment: MainAxisAlignment.end,
-                 children: [
-                     ElevatedButton(
-                        onPressed: () {
-                          // Access WebSocketService via context
-                          final wsService = Provider.of<WebSocketService>(context, listen: false);
-                          if (wsService.status == WebSocketStatus.connected) {
-                              final buyMessage = {
-                                  'type': 'buy',
-                                  'post_id': post.id
-                              };
-                              wsService.sendMessage(buyMessage);
-                          } else {
-                               ScaffoldMessenger.of(context).showSnackBar(
-                                const SnackBar(content: Text('Not connected'), backgroundColor: Colors.orange),
-                            );
-                          }
-                        },
-                        child: const Text('Buy')
-                     ),
-                     const SizedBox(width: 8),
-                     ElevatedButton(
-                         onPressed: () {
-                            final wsService = Provider.of<WebSocketService>(context, listen: false);
-                            if (wsService.status == WebSocketStatus.connected) {
-                                final sellMessage = {
-                                    'type': 'sell',
-                                    'post_id': post.id
-                                };
-                                wsService.sendMessage(sellMessage);
-                             } else {
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                const SnackBar(content: Text('Not connected'), backgroundColor: Colors.orange),
-                            );
-                          }
-                        },
-                        child: const Text('Sell')
-                     ),
-                 ],
+
+              // Quantity Input and Action Buttons Row
+             Padding(
+               padding: const EdgeInsets.only(top: 8.0),
+               child: Row(
+                   // mainAxisAlignment: MainAxisAlignment.end,
+                   children: [
+                      // Quantity Input Field
+                       SizedBox(
+                          width: 100, // Constrain width of text field
+                          child: TextField(
+                             controller: _quantityController,
+                             focusNode: _quantityFocusNode,
+                             decoration: const InputDecoration(
+                                labelText: 'Quantity',
+                                border: OutlineInputBorder(),
+                                isDense: true, // Make it more compact
+                                contentPadding: EdgeInsets.symmetric(horizontal: 8.0, vertical: 10.0),
+                             ),
+                             keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                             // InputFormatters? Optional, for stricter input
+                             textAlign: TextAlign.right,
+                           ),
+                       ),
+                       const Spacer(), // Push buttons to the right
+                       // Buy Button
+                       ElevatedButton(
+                          onPressed: () => _sendTradeMessage('buy'),
+                          style: ElevatedButton.styleFrom(backgroundColor: Colors.green[100]),
+                          child: const Text('Buy')
+                       ),
+                       const SizedBox(width: 8),
+                       // Sell Button
+                       ElevatedButton(
+                           onPressed: () => _sendTradeMessage('sell'),
+                           style: ElevatedButton.styleFrom(backgroundColor: Colors.red[100]),
+                           child: const Text('Sell')
+                       ),
+                   ],
+               ),
              )
           ],
         ),
@@ -1023,7 +1075,8 @@ class PostWidget extends StatelessWidget {
   // Helper widget to display position details
   Widget _buildPositionInfo(BuildContext context, PositionDetail detail) {
       final avgPriceFormatted = NumberFormat.currency(symbol: '\$', decimalDigits: 4).format(detail.averagePrice);
-      
+      final sizeFormatted = detail.size.toStringAsFixed(4); // Show precision
+
       // Use PNL directly from the detail object (sent by server)
       final pnlFormatted = NumberFormat.currency(symbol: '\$', decimalDigits: 2).format(detail.unrealizedPnl);
       final pnlColor = detail.unrealizedPnl >= 0 ? Colors.green[700] : Colors.red[700];
@@ -1040,14 +1093,14 @@ class PostWidget extends StatelessWidget {
              crossAxisAlignment: CrossAxisAlignment.start,
              children: [
                  Text(
-                     'Your Position:', 
+                     'Your Position:',
                      style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.bold)
                  ),
                  const SizedBox(height: 4),
                  Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                        Text('Size: ${detail.size}'),
+                        Text('Size: $sizeFormatted'), // Use formatted size
                         Text('Avg Price: $avgPriceFormatted'),
                     ],
                  ),
