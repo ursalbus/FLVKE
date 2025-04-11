@@ -638,14 +638,19 @@ async fn handle_client_message(
                                 // BUT, if the buy ALSO opens a long (quantity > old_size.abs()), add the cost for that part.
                                 else if old_size < -EPSILON && quantity > old_size.abs() { 
                                     let long_opening_quantity = quantity - old_size.abs();
-                                    // Cost for this part: Integral from 0 to (new_supply)
-                                    // new_supply here is the final supply after the full buy, which equals long_opening_quantity
-                                    let cost_for_long_part = calculate_cost(0.0, long_opening_quantity); 
+
+                                    // ---- CORRECTED Basis for Opening Long ----
+                                    // Calculate cost for the actual supply change that opened the long position.
+                                    // The short position (size old_size.abs()) finished closing when supply reached (current_supply + old_size.abs()).
+                                    let reduction_amount = old_size.abs(); // Re-calculate reduction amount here for clarity
+                                    let supply_at_zero_crossing = current_supply + reduction_amount; // Supply when user became flat
+                                    let cost_for_long_part = calculate_cost(supply_at_zero_crossing, new_supply);
+                                    // ---- End Correction ----
 
                                     // Add this cost to the basis (which should be near zero after the short cover adjustment)
                                     user_position.total_cost_basis += cost_for_long_part;
-                                    println!("   -> Adding Long Basis (Short Cover + Open Long): Qty: {:.6}, Cost for Long Part: {:.6}, Total Basis: {:.6}",
-                                            long_opening_quantity, cost_for_long_part, user_position.total_cost_basis);
+                                    println!("   -> Adding Long Basis (Short Cover + Open Long): Qty: {:.6}, Cost for Long Part (Supply {:.6} -> {:.6}): {:.6}, Total Basis: {:.6}",
+                                            long_opening_quantity, supply_at_zero_crossing, new_supply, cost_for_long_part, user_position.total_cost_basis);
                                 }
 
                                 
