@@ -4,6 +4,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:provider/provider.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:intl/intl.dart'; // For date formatting
+import 'dart:math'; // For math operations
 
 // --- Constants ---
 const String WEBSOCKET_URL = 'ws://localhost:8080/ws'; // Placeholder for server URL
@@ -170,6 +171,50 @@ class UnknownMessage extends ServerMessage {
    final String type;
    final Map<String, dynamic> data;
    const UnknownMessage({required this.type, required this.data});
+}
+
+// --- Bonding Curve Calculation Helpers (Dart mirror of Rust logic) ---
+
+const double _BONDING_CURVE_EPSILON = 1e-9;
+
+// Integral of P(s) from 0 to s, for s > 0
+// Int(1 + sqrt(x) dx) = x + (2/3)x^(3/2)
+double _integralPos(double s) {
+  if (s <= _BONDING_CURVE_EPSILON) { // Treat s<=0 as 0
+    return 0.0;
+  } else {
+    return s + (2.0 / 3.0) * pow(s, 1.5);
+  }
+}
+
+// Integral of P(s) from s to 0, for s < 0. Result is >= 0.
+// 2*sqrt(|s|) - 2*ln(1+sqrt(|s|))
+double _integralNegToZero(double s) {
+  if (s >= -_BONDING_CURVE_EPSILON) { // Treat s>=0 as 0
+    return 0.0;
+  } else {
+    final t = s.abs(); // t = |s|
+    return 2.0 * sqrt(t) - 2.0 * log(1.0 + sqrt(t));
+  }
+}
+
+// Calculate the cost (definite integral) of changing supply from s1 to s2
+// Cost = Integral[s1, s2] P(x) dx
+//      = Integral[0, s2] P(x) dx - Integral[0, s1] P(x) dx
+double calculateBondingCurveCost(double s1, double s2) {
+  if (s1.isNaN || s1.isInfinite || s2.isNaN || s2.isInfinite) {
+    return double.nan;
+  }
+
+  final integralAtS2 = (s2 > _BONDING_CURVE_EPSILON)
+      ? _integralPos(s2)
+      : (s2 < -_BONDING_CURVE_EPSILON ? -_integralNegToZero(s2) : 0.0);
+
+  final integralAtS1 = (s1 > _BONDING_CURVE_EPSILON)
+      ? _integralPos(s1)
+      : (s1 < -_BONDING_CURVE_EPSILON ? -_integralNegToZero(s1) : 0.0);
+
+  return integralAtS2 - integralAtS1;
 }
 
 // --- Services ---
@@ -941,21 +986,81 @@ class _PostWidgetState extends State<PostWidget> { // <-- Added State class
   final _quantityController = TextEditingController(text: '1.0'); // Default to 1.0
   final _quantityFocusNode = FocusNode();
 
+  double _buyCost = 0.0;
+  double _sellProceeds = 0.0;
+  bool _isQuantityValid = true; // Track validity for button enabling
+
+  @override
+  void initState() {
+    super.initState();
+    _quantityController.addListener(_calculateCosts);
+    // Calculate initial costs based on default quantity
+    WidgetsBinding.instance.addPostFrameCallback((_) => _calculateCosts());
+  }
+
   @override
   void dispose() {
+    _quantityController.removeListener(_calculateCosts);
     _quantityController.dispose();
     _quantityFocusNode.dispose();
     super.dispose();
   }
+
+  @override
+  void didUpdateWidget(covariant PostWidget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Recalculate costs if the post supply has changed
+    if (oldWidget.post.supply != widget.post.supply) {
+       print("Post supply changed (${oldWidget.post.supply} -> ${widget.post.supply}), recalculating costs.");
+      _calculateCosts();
+    }
+  }
+
+  void _calculateCosts() {
+    final quantityText = _quantityController.text.trim();
+    final quantity = double.tryParse(quantityText);
+    
+    if (quantity == null || quantity <= 0) {
+       if (mounted) { // Check if widget is still mounted
+            setState(() {
+               _buyCost = 0.0;
+               _sellProceeds = 0.0;
+               _isQuantityValid = false;
+            });
+       }
+      return;
+    }
+
+    final currentSupply = widget.post.supply;
+    
+    // Calculate cost to buy
+    final buyEndSupply = currentSupply + quantity;
+    final buyCost = calculateBondingCurveCost(currentSupply, buyEndSupply);
+
+    // Calculate proceeds to sell
+    final sellEndSupply = currentSupply - quantity;
+    final sellProceeds = calculateBondingCurveCost(sellEndSupply, currentSupply); // Integral from end to start
+    
+     if (mounted) { // Check if widget is still mounted
+        setState(() {
+           _buyCost = buyCost.isNaN ? 0.0 : buyCost;
+           _sellProceeds = sellProceeds.isNaN ? 0.0 : sellProceeds;
+           _isQuantityValid = !buyCost.isNaN && !sellProceeds.isNaN;
+        });
+     }
+  }
+
 
   // Helper function to parse quantity and handle errors
   double? _parseQuantity() {
     final quantityText = _quantityController.text.trim();
     final quantity = double.tryParse(quantityText);
     if (quantity == null || quantity <= 0) {
-       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Invalid quantity: $quantityText. Must be a positive number.'), backgroundColor: Colors.red),
-      );
+       // Use setState here? Maybe not, as _calculateCosts handles UI state
+       // Only show snackbar if trying to submit invalid qty?
+       // ScaffoldMessenger.of(context).showSnackBar(
+       //  SnackBar(content: Text('Invalid quantity: $quantityText. Must be a positive number.'), backgroundColor: Colors.red),
+       // );
       return null;
     }
     return quantity;
@@ -963,8 +1068,15 @@ class _PostWidgetState extends State<PostWidget> { // <-- Added State class
 
    // Helper function to send buy/sell message
   void _sendTradeMessage(String type) {
-      final quantity = _parseQuantity();
-      if (quantity == null) return; // Error already shown
+      if (!_isQuantityValid) { // Use state variable to check validity
+         ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Invalid quantity entered.'), backgroundColor: Colors.red),
+         );
+         return;
+      }
+      
+      final quantity = _parseQuantity(); // Should be valid if _isQuantityValid is true
+      if (quantity == null) return; // Should not happen, but defensive check
 
       final wsService = Provider.of<WebSocketService>(context, listen: false);
       if (wsService.status == WebSocketStatus.connected) {
@@ -1052,16 +1164,22 @@ class _PostWidgetState extends State<PostWidget> { // <-- Added State class
                        const Spacer(), // Push buttons to the right
                        // Buy Button
                        ElevatedButton(
-                          onPressed: () => _sendTradeMessage('buy'),
-                          style: ElevatedButton.styleFrom(backgroundColor: Colors.green[100]),
-                          child: const Text('Buy')
+                          onPressed: _isQuantityValid ? () => _sendTradeMessage('buy') : null, // Disable if invalid
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.green[100],
+                            disabledBackgroundColor: Colors.grey[300], // Style for disabled state
+                          ),
+                          child: Text('Buy (${NumberFormat.currency(symbol: '\$').format(_buyCost)})') // Show cost
                        ),
                        const SizedBox(width: 8),
                        // Sell Button
                        ElevatedButton(
-                           onPressed: () => _sendTradeMessage('sell'),
-                           style: ElevatedButton.styleFrom(backgroundColor: Colors.red[100]),
-                           child: const Text('Sell')
+                           onPressed: _isQuantityValid ? () => _sendTradeMessage('sell') : null, // Disable if invalid
+                           style: ElevatedButton.styleFrom(
+                             backgroundColor: Colors.red[100],
+                             disabledBackgroundColor: Colors.grey[300], // Style for disabled state
+                           ),
+                           child: Text('Sell (${NumberFormat.currency(symbol: '\$').format(_sellProceeds)})') // Show proceeds
                        ),
                    ],
                ),
