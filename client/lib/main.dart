@@ -176,6 +176,7 @@ class UnknownMessage extends ServerMessage {
 // --- Bonding Curve Calculation Helpers (Dart mirror of Rust logic) ---
 
 const double _BONDING_CURVE_EPSILON = 1e-9;
+const double _EPSILON = 1e-9; // General purpose epsilon
 
 // Integral of P(s) from 0 to s, for s > 0
 // Int(1 + sqrt(x) dx) = x + (2/3)x^(3/2)
@@ -1107,6 +1108,21 @@ class _PostWidgetState extends State<PostWidget> { // <-- Added State class
      // Consume PositionState to get user's position details for *this* post
      final positionState = Provider.of<PositionState>(context);
      final positionDetail = positionState.positions[widget.post.id];
+     final currentPositionSize = positionDetail?.size ?? 0.0; // Default to 0 if no position
+
+     // Consume BalanceState to get user's balance
+     final balanceState = Provider.of<BalanceState>(context);
+     final currentBalance = balanceState.balance;
+
+     // --- Button Disabling Logic ---
+     bool canBuy = _isQuantityValid && _buyCost <= currentBalance;
+
+     // Can sell if: quantity is valid AND (either user is long OR (user is flat/short AND has enough balance for collateral))
+     bool canSell = _isQuantityValid && 
+         (currentPositionSize > _EPSILON || // User is long (can always reduce/close)
+          (currentPositionSize <= _EPSILON && _sellProceeds <= currentBalance) // User is flat/short, check collateral
+         );
+     // --- End Button Disabling Logic ---
 
     return Card(
       margin: const EdgeInsets.symmetric(vertical: 8.0, horizontal: 12.0),
@@ -1164,22 +1180,24 @@ class _PostWidgetState extends State<PostWidget> { // <-- Added State class
                        const Spacer(), // Push buttons to the right
                        // Buy Button
                        ElevatedButton(
-                          onPressed: _isQuantityValid ? () => _sendTradeMessage('buy') : null, // Disable if invalid
+                          onPressed: canBuy ? () => _sendTradeMessage('buy') : null, // Use calculated canBuy
                           style: ElevatedButton.styleFrom(
                             backgroundColor: Colors.green[100],
                             disabledBackgroundColor: Colors.grey[300], // Style for disabled state
+                            foregroundColor: canBuy ? Colors.black : Colors.grey[700], // Text color
                           ),
-                          child: Text('Buy (${NumberFormat.currency(symbol: '\$').format(_buyCost)})') // Show cost
+                          child: Text('Buy (\$${_buyCost.toStringAsFixed(2)})') // Show cost with 2 decimal places
                        ),
                        const SizedBox(width: 8),
                        // Sell Button
                        ElevatedButton(
-                           onPressed: _isQuantityValid ? () => _sendTradeMessage('sell') : null, // Disable if invalid
+                           onPressed: canSell ? () => _sendTradeMessage('sell') : null, // Use calculated canSell
                            style: ElevatedButton.styleFrom(
                              backgroundColor: Colors.red[100],
                              disabledBackgroundColor: Colors.grey[300], // Style for disabled state
+                             foregroundColor: canSell ? Colors.black : Colors.grey[700], // Text color
                            ),
-                           child: Text('Sell (${NumberFormat.currency(symbol: '\$').format(_sellProceeds)})') // Show proceeds
+                           child: Text('Sell (\$${_sellProceeds.toStringAsFixed(2)})') // Show proceeds with 2 decimal places
                        ),
                    ],
                ),
