@@ -736,7 +736,7 @@ async fn handle_client_message(
                             // Check balance ONLY if opening/increasing short
                             // Need enough balance to cover the initial "proceeds" which become collateral
                              let cost_to_open_short = trade_proceeds; // For shorting, proceeds are the cost/collateral
-                            if old_size > -EPSILON && new_supply < current_supply { // If going short or increasing short
+                            if old_size <= EPSILON && quantity > EPSILON { // Corrected: Only check if was flat or short and selling (opening/increasing short)
                                 if *user_balance < cost_to_open_short {
                                     println!(
                                         "-> Sell FAIL (Short): User {} Insufficient balance ({:.6}) for collateral {:.6} (Quantity: {:.6})",
