@@ -86,6 +86,7 @@ struct PositionDetail {
 enum ServerMessage {
     InitialState { posts: Vec<Post> },
     UserSync { 
+        margin: f64,
         balance: f64,
         positions: Vec<PositionDetail>,
         total_realized_pnl: f64, // Added
@@ -100,6 +101,7 @@ enum ServerMessage {
         unrealized_pnl: f64,
     },
     RealizedPnlUpdate { total_realized_pnl: f64 }, // Added
+    MarginUpdate { margin: f64 }, // Added
     Error { message: String },
 }
 
@@ -139,6 +141,33 @@ fn calculate_unrealized_pnl(
         // PNL = (Current Price - Average Price) * Size
         (current_market_price - avg_price) * position.size
     }
+}
+
+// --- Margin Calculation Helper ---
+
+fn calculate_user_margin(user_id: &str, state: &AppState) -> f64 {
+    let balance = state.user_balances.get(user_id).map_or(INITIAL_BALANCE, |b| *b.value());
+    let mut total_unrealized_pnl = 0.0;
+
+    if let Some(user_positions_map) = state.user_positions.get(user_id) {
+        for position_entry in user_positions_map.iter() {
+            let post_id = *position_entry.key();
+            let position = position_entry.value();
+
+            if position.size.abs() > EPSILON {
+                // Get current market price for the post
+                if let Some(market_post) = state.posts.get(&post_id) {
+                    let current_market_price = market_post.price.unwrap_or_else(|| get_price(market_post.supply));
+                    total_unrealized_pnl += calculate_unrealized_pnl(position, current_market_price);
+                } else {
+                    // Should not happen if data is consistent, but handle defensively
+                    eprintln!("Warning: Post {} not found while calculating margin for user {}", post_id, user_id);
+                }
+            }
+        }
+    }
+    // Margin = Balance + Total Unrealized PNL
+    balance + total_unrealized_pnl
 }
 
 // --- Bonding Curve Logic ---
@@ -331,6 +360,8 @@ async fn handle_connection(ws: WebSocket, user_id: String, state: AppState) {
     let user_balance = *state.user_balances.entry(user_id.clone()).or_insert(INITIAL_BALANCE);
     // Fetch realized PNL, defaulting to 0.0 if user not found
     let total_realized_pnl = *state.user_realized_pnl.entry(user_id.clone()).or_insert(0.0);
+    // Calculate initial margin
+    let initial_margin = calculate_user_margin(&user_id, &state); // Use helper
     let user_positions_detail: Vec<PositionDetail> = state
         .user_positions
         .get(&user_id)
@@ -366,6 +397,7 @@ async fn handle_connection(ws: WebSocket, user_id: String, state: AppState) {
         .unwrap_or_else(Vec::new);
 
     let user_sync_msg = ServerMessage::UserSync {
+        margin: initial_margin, // Add margin
         balance: user_balance,
         positions: user_positions_detail,
         total_realized_pnl, // Send fetched/defaulted value
@@ -465,6 +497,10 @@ async fn broadcast_market_and_position_updates(
                      );
                      // Use the existing send_to_client helper
                       send_to_client(current_client_id, position_update_msg, state).await;
+
+                     // Send Margin Update for the *other* user
+                     let other_user_margin = calculate_user_margin(user_id, state);
+                     send_to_client(current_client_id, ServerMessage::MarginUpdate { margin: other_user_margin }, state).await;
                  }
              }
          }
@@ -510,6 +546,7 @@ fn message_type_for_debug(msg: &ServerMessage) -> &'static str {
         ServerMessage::BalanceUpdate { .. } => "BalanceUpdate",
         ServerMessage::PositionUpdate { .. } => "PositionUpdate",
         ServerMessage::RealizedPnlUpdate { .. } => "RealizedPnlUpdate", // Added
+        ServerMessage::MarginUpdate { .. } => "MarginUpdate", // Added
         ServerMessage::Error { .. } => "Error",
     }
 }
@@ -556,164 +593,164 @@ async fn handle_client_message(
                             return;
                         }
 
-                        if let Some(mut post_entry) = state.posts.get_mut(&post_id) {
-                            let post = &mut *post_entry;
-                            let current_supply = post.supply;
-                            let new_supply = current_supply + quantity;
-
-                            // Calculate cost using integral
-                            let trade_cost = calculate_cost(current_supply, new_supply);
-                            if trade_cost.is_nan() {
-                                println!("-> Buy FAIL: Cost calculation resulted in NaN (Supplies: {} -> {})", current_supply, new_supply);
-                                send_to_client(client_id, ServerMessage::Error { message: "Internal error calculating trade cost.".to_string() }, state).await;
+                        // --- Refactor Step 1: Read needed state --- 
+                        let maybe_post_data = state.posts.get(&post_id).map(|p| (p.supply, p.price));
+                        let user_balance_val = state.user_balances.get(user_id).map_or(INITIAL_BALANCE, |b| *b.value());
+                        let user_position_val = state.user_positions.get(user_id)
+                            .and_then(|positions| positions.get(&post_id).map(|pos_detail| pos_detail.clone())); // Clone to release lock
+                        
+                        // --- Refactor Step 2: Perform checks and calculations --- 
+                        
+                        // Check if post exists
+                        let (current_supply, _) = match maybe_post_data {
+                            Some((supply, _)) => (supply, ()), // Ignore price for now, get it after potential update
+                            None => {
+                                println!("-> Buy FAIL: Post {} not found", post_id);
+                                send_to_client(client_id, ServerMessage::Error { message: format!("Post {} not found", post_id) }, state).await;
                                 return;
                             }
+                        };
+                        
+                        let new_supply = current_supply + quantity;
+                        let trade_cost = calculate_cost(current_supply, new_supply);
 
-                             // Use the price at the *end* supply for display/PNL calculations
-                             let final_price = get_price(new_supply);
+                        if trade_cost.is_nan() {
+                            println!("-> Buy FAIL: Cost calculation resulted in NaN (Supplies: {} -> {})", current_supply, new_supply);
+                            send_to_client(client_id, ServerMessage::Error { message: "Internal error calculating trade cost.".to_string() }, state).await;
+                            return;
+                        }
 
+                        // Check balance
+                        if user_balance_val < trade_cost {
+                             println!(
+                                "-> Buy FAIL: User {} Insufficient balance ({:.6}) for cost {:.6} (Quantity: {:.6})",
+                                user_id, user_balance_val, trade_cost, quantity
+                            );
+                            send_to_client(client_id, ServerMessage::Error { message: format!("Insufficient balance ({:.6}) for buy cost {:.6}", user_balance_val, trade_cost) }, state).await;
+                            return;
+                        }
+                        
+                        // Calculate PNL if covering short
+                        let old_position = user_position_val.unwrap_or_default(); // Use default if no previous position
+                        let old_size = old_position.size;
+                        let mut realized_pnl_for_trade = 0.0;
+                        let mut basis_change_for_short_cover = 0.0;
+                        let mut avg_short_entry_price = 0.0; // For logging
+                        let mut avg_cost_of_buy_reduction = 0.0; // For logging
+
+                        if old_size < -EPSILON {
+                            let reduction_amount = quantity.min(old_size.abs());
+                            if reduction_amount > EPSILON {
+                                avg_short_entry_price = if old_size.abs() > EPSILON { old_position.total_cost_basis / old_size } else { 0.0 };
+                                let exact_cost_for_reduction = calculate_cost(current_supply, current_supply + reduction_amount);
+                                avg_cost_of_buy_reduction = if reduction_amount.abs() > EPSILON { exact_cost_for_reduction / reduction_amount } else { 0.0 };
+                                
+                                realized_pnl_for_trade = (avg_short_entry_price - avg_cost_of_buy_reduction) * reduction_amount;
+                                basis_change_for_short_cover = avg_short_entry_price * reduction_amount; // Amount to add back to basis
+                            }
+                        }
+                        
+                        // --- Refactor Step 3: Acquire locks and update state --- 
+                        let mut total_pnl_updated = false; // Declare outside the scope
+                        let final_price;
+                        let final_position;
+                        let final_balance;
+                        let final_total_realized_pnl;
+                        
+                        { // Scope for mutable references
+                            // Lock Post
+                             let mut post_entry = match state.posts.get_mut(&post_id) {
+                                 Some(entry) => entry,
+                                 None => return, // Should have been caught earlier, but defensive
+                             };
+                             let post = &mut *post_entry;
+                             post.supply = new_supply;
+                             final_price = get_price(new_supply); // Calculate final price *after* supply update
+                             post.price = Some(final_price);
+
+                            // Lock Balance
                             let mut balance_entry = state.user_balances.entry(user_id.to_string()).or_insert(INITIAL_BALANCE);
-                            let user_balance = balance_entry.value_mut();
+                            *balance_entry -= trade_cost;
+                            final_balance = *balance_entry;
+                            
+                            // Lock Position
                             let user_positions_for_user = state.user_positions.entry(user_id.to_string()).or_default();
                             let mut user_position = user_positions_for_user.entry(post_id).or_insert_with(UserPositionDetail::default);
+                            user_position.size += quantity;
 
-                            let old_size = user_position.size;
-                            let mut realized_pnl_for_trade = 0.0;
+                            // Update basis based on calculations done earlier
+                             if old_size < -EPSILON {
+                                 user_position.total_cost_basis += basis_change_for_short_cover;
+                                  println!(
+                                    "   -> Covering short: Reduction: {:.6}, Avg Short Entry Prc: {:.6}, Avg Buy Cost (Reduction Only): {:.6}, Basis Change: +{:.6}, Pnl: {:.6}",
+                                    quantity.min(old_size.abs()), avg_short_entry_price, avg_cost_of_buy_reduction, basis_change_for_short_cover, realized_pnl_for_trade
+                                  );
+                             }
 
-                            // Check if reducing a short position
-                            if old_size < -EPSILON {
-                                let reduction_amount = quantity.min(old_size.abs());
-                                if reduction_amount > EPSILON {
-                                    // ---- CORRECTED PNL Calculation ----
-                                    // Calculate the average entry price of the short position being covered
-                                    // Basis is negative for shorts, so this should be positive.
-                                    let avg_short_entry_price = if old_size.abs() > EPSILON {
-                                        user_position.total_cost_basis / old_size // (neg / neg = pos)
-                                    } else {
-                                        0.0 // Should not happen if old_size < -EPSILON
-                                    };
-
-                                    // Calculate the exact cost ONLY for the part closing the short position
-                                    let exact_cost_for_reduction = calculate_cost(current_supply, current_supply + reduction_amount);
-
-                                    // Calculate the average buy cost specifically for this closing part
-                                    let avg_cost_of_buy = if reduction_amount.abs() > EPSILON {
-                                         exact_cost_for_reduction / reduction_amount
-                                     } else {
-                                         0.0 // Avoid division by zero
-                                     };
-                                    // ---- End Correction ----
-                                     
-                                    // PNL = (Avg Short Entry Price - Avg Buy Cost for this reduction) * reduction_amount
-                                    realized_pnl_for_trade = (avg_short_entry_price - avg_cost_of_buy) * reduction_amount;
-
-                                    // Basis adjustment: Add back the proportional average cost basis of the covered short amount
-                                    // Cost basis becomes less negative (moves towards zero)
-                                    let basis_change = avg_short_entry_price * reduction_amount;
-                                    user_position.total_cost_basis += basis_change; 
-                                     println!(
-                                        "   -> Covering short: Reduction: {:.6}, Avg Short Entry Prc: {:.6}, Avg Buy Cost (Reduction Only): {:.6}, Basis Change: +{:.6}, Pnl: {:.6}",
-                                        reduction_amount, avg_short_entry_price, avg_cost_of_buy, basis_change, realized_pnl_for_trade
-                                     );
-                                }
+                            // Add cost basis for long part
+                            if old_size >= -EPSILON { // Started flat or long
+                                user_position.total_cost_basis += trade_cost;
+                                println!("   -> Adding Long Basis (Flat/Long Start): Cost: {:.6}, Total Basis: {:.6}", 
+                                        trade_cost, user_position.total_cost_basis);
+                            } else if quantity > old_size.abs() { // Covered short AND opened long
+                                let long_opening_quantity = quantity - old_size.abs();
+                                let supply_at_zero_crossing = current_supply + old_size.abs();
+                                let cost_for_long_part = calculate_cost(supply_at_zero_crossing, new_supply);
+                                user_position.total_cost_basis += cost_for_long_part;
+                                println!("   -> Adding Long Basis (Short Cover + Open Long): Qty: {:.6}, Cost for Long Part (Supply {:.6} -> {:.6}): {:.6}, Total Basis: {:.6}",
+                                        long_opening_quantity, supply_at_zero_crossing, new_supply, cost_for_long_part, user_position.total_cost_basis);
                             }
-
-                            // Check balance 
-                            if *user_balance >= trade_cost {
-                                // --- Execute Trade --- 
-                                *user_balance -= trade_cost;
-                                post.supply = new_supply;
-                                post.price = Some(final_price); // Store price AFTER trade
-                                user_position.size += quantity;
-
-                                
-                                // Add cost basis ONLY if establishing/increasing a LONG position
-                                if old_size >= -EPSILON { // If was flat or long
-                                     // In this case, the entire trade contributes to the long basis
-                                     user_position.total_cost_basis += trade_cost;
-                                     println!("   -> Adding Long Basis (Flat/Long Start): Cost: {:.6}, Total Basis: {:.6}", 
-                                             trade_cost, user_position.total_cost_basis);
-                                }
-                                // NOTE: If covering short (old_size < -EPSILON), the basis adjustment for the *short part* was handled above.
-                                // BUT, if the buy ALSO opens a long (quantity > old_size.abs()), add the cost for that part.
-                                else if old_size < -EPSILON && quantity > old_size.abs() { 
-                                    let long_opening_quantity = quantity - old_size.abs();
-
-                                    // ---- CORRECTED Basis for Opening Long ----
-                                    // Calculate cost for the actual supply change that opened the long position.
-                                    // The short position (size old_size.abs()) finished closing when supply reached (current_supply + old_size.abs()).
-                                    let reduction_amount = old_size.abs(); // Re-calculate reduction amount here for clarity
-                                    let supply_at_zero_crossing = current_supply + reduction_amount; // Supply when user became flat
-                                    let cost_for_long_part = calculate_cost(supply_at_zero_crossing, new_supply);
-                                    // ---- End Correction ----
-
-                                    // Add this cost to the basis (which should be near zero after the short cover adjustment)
-                                    user_position.total_cost_basis += cost_for_long_part;
-                                    println!("   -> Adding Long Basis (Short Cover + Open Long): Qty: {:.6}, Cost for Long Part (Supply {:.6} -> {:.6}): {:.6}, Total Basis: {:.6}",
-                                            long_opening_quantity, supply_at_zero_crossing, new_supply, cost_for_long_part, user_position.total_cost_basis);
-                                }
-
-                                
-                                // --- Handle Realized PNL & Potential Basis Reset --- 
-                                let mut total_pnl_updated = false;
-                                if realized_pnl_for_trade.abs() > EPSILON {
-                                    println!(
-                                        "   -> Realizing PNL (Buy Cover): {:.6} for User {}",
-                                        realized_pnl_for_trade, user_id
-                                    );
-                                    let mut total_pnl = state.user_realized_pnl.entry(user_id.to_string()).or_insert(0.0);
-                                    *total_pnl += realized_pnl_for_trade;
-                                     // Do NOT add realized PNL directly to balance here, it's implicitly handled
-                                     // by the cost calculation (buy cost vs short proceeds difference).
-                                    total_pnl_updated = true;
-                                }
-                                
-                                // Check if position is now flat and reset basis
-                                if user_position.size.abs() < EPSILON {
-                                     println!("   -> Position size is near zero ({:.8}) after trade, resetting basis.", user_position.size);
-                                     user_position.size = 0.0; // Force to exactly 0
-                                     user_position.total_cost_basis = 0.0;
-                                 }
-
-                                // --- Calculate Post-Trade State --- 
-                                let new_size = user_position.size;
-                                // Determine the average price to display
-                                let display_avg_price = calculate_average_price(&user_position);
-                                let actual_avg_price = calculate_average_price(&user_position); // For PNL calc
-                                let unrealized_pnl = calculate_unrealized_pnl(&user_position, final_price); // Use final price
-
+                            
+                            // Update Realized PNL if necessary
+                            if realized_pnl_for_trade.abs() > EPSILON {
                                 println!(
-                                    "-> Buy OK (Qty: {:.6}, Cost: {:.6}): Post {} (Supply: {:.6}, Price: {:.6}), User {} (Pos: {:.6}, Avg Prc: {:.6}, URPnl: {:.6}, Bal: {:.6}) RPnlTrade: {:.6}",
-                                    quantity, trade_cost, post_id, post.supply, final_price, user_id, new_size, 
-                                    display_avg_price, // Log the displayed price
-                                    // actual_avg_price, // Remove other avg price log
-                                    unrealized_pnl, *user_balance, realized_pnl_for_trade
+                                    "   -> Realizing PNL (Buy Cover): {:.6} for User {}",
+                                    realized_pnl_for_trade, user_id
                                 );
-
-                                // --- Send Updates --- 
-                                send_to_client(client_id, ServerMessage::BalanceUpdate { balance: *user_balance }, state).await;
-                                if total_pnl_updated {
-                                     let final_total_pnl = state.user_realized_pnl.get(user_id).map_or(0.0, |v| *v.value());
-                                     send_to_client(client_id, ServerMessage::RealizedPnlUpdate { total_realized_pnl: final_total_pnl }, state).await;
-                                }
-                                send_to_client(client_id, ServerMessage::PositionUpdate {
-                                    post_id, size: new_size, 
-                                    average_price: display_avg_price.abs(), // Send the calculated display price
-                                    unrealized_pnl 
-                                 }, state).await;
-                                broadcast_market_and_position_updates(post_id, final_price, post.supply, client_id, state).await; // Use final price/supply
-
+                                let mut total_pnl = state.user_realized_pnl.entry(user_id.to_string()).or_insert(0.0);
+                                *total_pnl += realized_pnl_for_trade;
+                                final_total_realized_pnl = *total_pnl;
+                                total_pnl_updated = true;
                             } else {
-                                println!(
-                                    "-> Buy FAIL: User {} Insufficient balance ({:.6}) for cost {:.6} (Quantity: {:.6})",
-                                     user_id, *user_balance, trade_cost, quantity
-                                );
-                                send_to_client(client_id, ServerMessage::Error { message: format!("Insufficient balance ({:.6}) for buy cost {:.6}", *user_balance, trade_cost) }, state).await;
+                                final_total_realized_pnl = state.user_realized_pnl.get(user_id).map_or(0.0, |v| *v.value());
                             }
-                        } else {
-                            println!("-> Buy FAIL: Post {} not found", post_id);
-                            send_to_client(client_id, ServerMessage::Error { message: format!("Post {} not found", post_id) }, state).await;
+
+                            // Reset basis if flat
+                             if user_position.size.abs() < EPSILON {
+                                 println!("   -> Position size is near zero ({:.8}) after trade, resetting basis.", user_position.size);
+                                 user_position.size = 0.0;
+                                 user_position.total_cost_basis = 0.0;
+                             }
+
+                            final_position = user_position.clone(); // Clone final state for logging/sending
+                             
+                        } // Mutable references are dropped here
+                        
+                        // --- Refactor Step 4: Log results and send updates --- 
+                        let display_avg_price = calculate_average_price(&final_position);
+                        let unrealized_pnl = calculate_unrealized_pnl(&final_position, final_price);
+
+                         println!(
+                            "-> Buy OK (Qty: {:.6}, Cost: {:.6}): Post {} (Supply: {:.6}, Price: {:.6}), User {} (Pos: {:.6}, Avg Prc: {:.6}, URPnl: {:.6}, Bal: {:.6}) RPnlTrade: {:.6}",
+                            quantity, trade_cost, post_id, new_supply, final_price, user_id, final_position.size, 
+                            display_avg_price, unrealized_pnl, final_balance, realized_pnl_for_trade
+                        );
+                        
+                         send_to_client(client_id, ServerMessage::BalanceUpdate { balance: final_balance }, state).await;
+                        if total_pnl_updated {
+                             send_to_client(client_id, ServerMessage::RealizedPnlUpdate { total_realized_pnl: final_total_realized_pnl }, state).await;
                         }
+                        send_to_client(client_id, ServerMessage::PositionUpdate {
+                            post_id, size: final_position.size, 
+                            average_price: display_avg_price.abs(),
+                            unrealized_pnl 
+                         }, state).await;
+                        let new_margin = calculate_user_margin(user_id, state);
+                        send_to_client(client_id, ServerMessage::MarginUpdate { margin: new_margin }, state).await;
+                        broadcast_market_and_position_updates(post_id, final_price, new_supply, client_id, state).await;
+                         
+                        // Note: Previous error handling for balance/post not found happens earlier now
+                    
                     }
                      ClientMessage::Sell { post_id, quantity } => {
                         if quantity <= EPSILON {
@@ -722,143 +759,121 @@ async fn handle_client_message(
                             return;
                         }
 
-                        if let Some(mut post_entry) = state.posts.get_mut(&post_id) {
-                            let post = &mut *post_entry;
-                            let current_supply = post.supply;
-                            let new_supply = current_supply - quantity;
+                        // --- Refactor Step 1: Read needed state --- 
+                        let maybe_post_data = state.posts.get(&post_id).map(|p| (p.supply, p.price));
+                        let user_balance_val = state.user_balances.get(user_id).map_or(INITIAL_BALANCE, |b| *b.value());
+                        let user_position_val = state.user_positions.get(user_id)
+                            .and_then(|positions| positions.get(&post_id).map(|pos_detail| pos_detail.clone())); // Clone to release lock
 
-                            // Calculate proceeds using integral
-                            // Proceeds for seller should be positive value received
-                             let trade_proceeds = calculate_cost(new_supply, current_supply); // <-- CORRECT: Cost from end to start supply
-
-                             if trade_proceeds.is_nan() || trade_proceeds < 0.0 { // Proceeds should be non-negative
-                                println!(
-                                    "-> Sell FAIL: Proceeds calculation invalid (Supplies: {} -> {}, Proceeds: {})",
-                                    current_supply, new_supply, trade_proceeds
-                                );
-                                send_to_client(client_id, ServerMessage::Error { message: "Internal error calculating trade proceeds.".to_string() }, state).await;
+                        // --- Refactor Step 2: Perform checks and calculations --- 
+                        
+                        // Check if post exists
+                        let (current_supply, _) = match maybe_post_data {
+                            Some((supply, _)) => (supply, ()),
+                            None => {
+                                println!("-> Sell FAIL: Post {} not found", post_id);
+                                send_to_client(client_id, ServerMessage::Error { message: format!("Post {} not found", post_id) }, state).await;
                                 return;
                             }
+                        };
+                        
+                        let new_supply = current_supply - quantity;
+                        let trade_proceeds = calculate_cost(new_supply, current_supply);
 
-                             // Use the price at the *end* supply for display/PNL calculations
-                             let final_price = get_price(new_supply);
+                        if trade_proceeds.is_nan() || trade_proceeds < 0.0 {
+                            println!(
+                                "-> Sell FAIL: Proceeds calculation invalid (Supplies: {} -> {}, Proceeds: {})",
+                                current_supply, new_supply, trade_proceeds
+                            );
+                            send_to_client(client_id, ServerMessage::Error { message: "Internal error calculating trade proceeds.".to_string() }, state).await;
+                            return;
+                        }
 
+                        let old_position = user_position_val.unwrap_or_default();
+                        let old_size = old_position.size;
+
+                        // Check balance ONLY if opening/increasing short
+                        if old_size <= EPSILON && quantity > EPSILON { // User is flat or short, and selling
+                            let cost_to_open_short = trade_proceeds; // Proceeds act as collateral
+                            if user_balance_val < cost_to_open_short {
+                                println!(
+                                    "-> Sell FAIL (Short): User {} Insufficient balance ({:.6}) for collateral {:.6} (Quantity: {:.6})",
+                                    user_id, user_balance_val, cost_to_open_short, quantity
+                                );
+                                send_to_client(client_id, ServerMessage::Error { message: format!("Insufficient balance ({:.6}) to cover short collateral {:.6}", user_balance_val, cost_to_open_short) }, state).await;
+                                return;
+                            }
+                        }
+                        
+                        // Calculate PNL if closing long
+                        let mut realized_pnl_for_trade = 0.0;
+                        let mut basis_removed = 0.0;
+                        let mut avg_price_before_long_close = 0.0; // For logging
+                        let mut avg_proceeds_of_sell_reduction = 0.0; // For logging
+
+                        if old_size > EPSILON {
+                            let reduction_amount = quantity.min(old_size);
+                            if reduction_amount > EPSILON {
+                                avg_price_before_long_close = calculate_average_price(&old_position);
+                                let exact_proceeds_for_reduction = calculate_cost(current_supply - reduction_amount, current_supply);
+                                avg_proceeds_of_sell_reduction = if reduction_amount.abs() > EPSILON { exact_proceeds_for_reduction / reduction_amount } else { 0.0 };
+                                realized_pnl_for_trade = (avg_proceeds_of_sell_reduction - avg_price_before_long_close) * reduction_amount;
+                                basis_removed = avg_price_before_long_close * reduction_amount; // Amount to remove from basis
+                            }
+                        }
+
+                        // --- Refactor Step 3: Acquire locks and update state --- 
+                        let mut total_pnl_updated = false; // Declare outside scope
+                        let final_price;
+                        let final_position;
+                        let final_balance;
+                        let final_total_realized_pnl;
+                        
+                        { // Scope for mutable references
+                            // Lock Post
+                             let mut post_entry = match state.posts.get_mut(&post_id) {
+                                 Some(entry) => entry,
+                                 None => return, // Should be caught earlier
+                             };
+                             let post = &mut *post_entry;
+                             post.supply = new_supply;
+                             final_price = get_price(new_supply);
+                             post.price = Some(final_price);
+
+                            // Lock Balance
                             let mut balance_entry = state.user_balances.entry(user_id.to_string()).or_insert(INITIAL_BALANCE);
-                            let user_balance = balance_entry.value_mut();
+                            *balance_entry += trade_proceeds; // Add proceeds from sell
+                            final_balance = *balance_entry;
+                            
+                            // Lock Position
                             let user_positions_for_user = state.user_positions.entry(user_id.to_string()).or_default();
                             let mut user_position = user_positions_for_user.entry(post_id).or_insert_with(UserPositionDetail::default);
-
-                            let old_size = user_position.size;
-                            let mut realized_pnl_for_trade = 0.0;
-
-                            // Check if reducing a long position
-                            if old_size > EPSILON {
-                                let reduction_amount = quantity.min(old_size);
-                                if reduction_amount > EPSILON {
-                                    let avg_price_before = calculate_average_price(&user_position);
-                                     // PNL = (Avg Sell Proceeds for this reduction - Avg Buy Cost) * reduction_amount
-                                     
-                                     // ---- CORRECTED PNL Calculation ----
-                                     // Calculate the exact proceeds ONLY for the part closing the long position
-                                     let exact_proceeds_for_reduction = calculate_cost(current_supply - reduction_amount, current_supply);
-                                     // Calculate the average sell price specifically for this closing part
-                                     let avg_proceeds_of_sell = if reduction_amount.abs() > EPSILON {
-                                         exact_proceeds_for_reduction / reduction_amount
-                                     } else {
-                                         0.0 // Avoid division by zero if reduction_amount is tiny
-                                     };
-                                     // ---- End Correction ----
-                                     
-                                    realized_pnl_for_trade = (avg_proceeds_of_sell - avg_price_before) * reduction_amount;
-
-                                    // Remove the proportional cost basis associated with the sold long position
-                                    let basis_removed = avg_price_before * reduction_amount;
-                                    user_position.total_cost_basis -= basis_removed; 
-                                     println!("   -> Selling long: Reduction: {:.6}, Avg Buy Prc: {:.6}, Avg Sell Prc (Reduction Only): {:.6}, Basis Removed: {:.6}, Pnl: {:.6}",
-                                        reduction_amount, avg_price_before, avg_proceeds_of_sell, basis_removed, realized_pnl_for_trade);
-                                }
-                            }
-
-                            // Check balance ONLY if opening/increasing short
-                            // Need enough balance to cover the initial "proceeds" which become collateral
-                             let cost_to_open_short = trade_proceeds; // For shorting, proceeds are the cost/collateral
-                            if old_size <= EPSILON && quantity > EPSILON { // Corrected: Only check if was flat or short and selling (opening/increasing short)
-                                if *user_balance < cost_to_open_short {
-                                    println!(
-                                        "-> Sell FAIL (Short): User {} Insufficient balance ({:.6}) for collateral {:.6} (Quantity: {:.6})",
-                                        user_id, *user_balance, cost_to_open_short, quantity
-                                    );
-                                    send_to_client(client_id, ServerMessage::Error { message: format!("Insufficient balance ({:.6}) to cover short collateral {:.6}", *user_balance, cost_to_open_short) }, state).await;
-                                    return;
-                                }
-                            }
-                            
-                            // --- Execute Trade --- 
-                             // Balance increases by the proceeds received
-                            *user_balance += trade_proceeds; // Add proceeds from sell
-                            post.supply = new_supply;
-                            post.price = Some(final_price); // Store price AFTER trade
                             user_position.size -= quantity;
 
-                             // Adjust cost basis
-                            if old_size <= EPSILON { // If was flat or opening/increasing SHORT position
-                                // ---- CORRECTED Basis Adjustment for Shorting ----
-                                // Calculate the proceeds ONLY for the part of the quantity that opens/increases the short.
-                                let shorting_quantity = if old_size < -EPSILON { // Already short, increasing short
-                                    quantity 
-                                } else { // Was flat (old_size ~ 0), opening short
-                                    quantity 
-                                };
-                                // Proceeds for this part: Integral from (current_supply - shorting_quantity) to current_supply
-                                // This should match `trade_proceeds` if the user started flat/short.
-                                let proceeds_for_shorting_part = calculate_cost(new_supply, new_supply + shorting_quantity);
+                            // Update basis based on calculations done earlier
+                             if old_size > EPSILON {
+                                 user_position.total_cost_basis -= basis_removed;
+                                 println!("   -> Selling long: Reduction: {:.6}, Avg Buy Prc: {:.6}, Avg Sell Prc (Reduction Only): {:.6}, Basis Removed: {:.6}, Pnl: {:.6}",
+                                    quantity.min(old_size), avg_price_before_long_close, avg_proceeds_of_sell_reduction, basis_removed, realized_pnl_for_trade);
+                             }
 
-                                // Basis becomes more negative by the proceeds received for the shorting part.
+                            // Adjust basis for short part
+                            if old_size <= EPSILON { // Started flat or short
+                                let shorting_quantity = quantity;
+                                let proceeds_for_shorting_part = calculate_cost(new_supply, new_supply + shorting_quantity); 
                                 user_position.total_cost_basis -= proceeds_for_shorting_part;
                                 println!("   -> Opening/Increasing Short: Qty: {:.6}, Proceeds for Short Part: {:.6}, Basis Change: {:.6}",
                                         shorting_quantity, proceeds_for_shorting_part, -proceeds_for_shorting_part);
-                                // ---- End Correction ----
-
-                                // If opening the short (flat before), store the entry price
-                                /*
-                                if old_size.abs() < EPSILON && quantity > EPSILON { 
-                                    let entry_price = trade_proceeds / quantity;
-                                    // user_position.entry_average_price = entry_price; // <-- REMOVE
-                                    println!(
-                                        "   -> Opened Short: Storing Entry Avg Price: {:.6}",
-                                        entry_price
-                                    );
-                                } 
-                                */
-
-                            } else { // Was reducing long position
-                                // Basis adjustment for reducing long was handled earlier
-                                // BUT, if the sell ALSO opens a short (quantity > old_size):
-                                if quantity > old_size { 
-                                    let shorting_quantity = quantity - old_size; // The part that opens the short
-
-                                    // ---- CORRECTED Basis for Opening Short ----
-                                    // Calculate proceeds for the actual supply change that opened the short.
-                                    // The long position (size old_size) finished selling when the supply reached (current_supply - old_size).
-                                    let supply_at_zero_crossing = current_supply - old_size; // Supply when user became flat
-                                    let proceeds_for_shorting_part = calculate_cost(new_supply, supply_at_zero_crossing);
-                                    // ---- End Correction ----
-
-                                    // Basis becomes negative by these proceeds.
-                                    // Note: total_cost_basis should be ~0 after the long part was removed.
-                                    user_position.total_cost_basis -= proceeds_for_shorting_part;
-                                    println!("   -> Opened Short (from Long): Qty: {:.6}, Proceeds for Short Part (Supply {:.6} -> {:.6}): {:.6}, Basis Change: {:.6}",
-                                            shorting_quantity, supply_at_zero_crossing, new_supply, proceeds_for_shorting_part, -proceeds_for_shorting_part);
-                                }
-
-                                if user_position.size.abs() < EPSILON { 
-                                     user_position.total_cost_basis = 0.0;
-                                    // user_position.entry_average_price = 0.0; // <-- REMOVE
-                                }
+                            } else if quantity > old_size { // Closed long AND opened short
+                                let shorting_quantity = quantity - old_size;
+                                let supply_at_zero_crossing = current_supply - old_size;
+                                let proceeds_for_shorting_part = calculate_cost(new_supply, supply_at_zero_crossing);
+                                user_position.total_cost_basis -= proceeds_for_shorting_part;
+                                println!("   -> Opened Short (from Long): Qty: {:.6}, Proceeds for Short Part (Supply {:.6} -> {:.6}): {:.6}, Basis Change: {:.6}",
+                                        shorting_quantity, supply_at_zero_crossing, new_supply, proceeds_for_shorting_part, -proceeds_for_shorting_part);
                             }
-                            
-                             // --- Handle Realized PNL & Potential Basis Reset ---
-                             let mut total_pnl_updated = false;
+
+                            // Update Realized PNL if necessary
                             if realized_pnl_for_trade.abs() > EPSILON {
                                 println!(
                                     "   -> Realizing PNL (Sell Long): {:.6} for User {}",
@@ -866,54 +881,46 @@ async fn handle_client_message(
                                 );
                                 let mut total_pnl = state.user_realized_pnl.entry(user_id.to_string()).or_insert(0.0);
                                 *total_pnl += realized_pnl_for_trade;
-                                // Do NOT add realized PNL directly to balance here, it's implicitly handled
-                                // by the proceeds calculation (sell proceeds vs buy cost difference).
+                                final_total_realized_pnl = *total_pnl;
                                 total_pnl_updated = true;
-
+                             } else {
+                                final_total_realized_pnl = state.user_realized_pnl.get(user_id).map_or(0.0, |v| *v.value());
                             }
 
-                             // Check if position is now flat and reset basis
+                            // Reset basis if flat
                              if user_position.size.abs() < EPSILON {
                                  println!("   -> Position size is near zero ({:.8}) after trade, resetting basis.", user_position.size);
-                                 user_position.size = 0.0; // Force to exactly 0
+                                 user_position.size = 0.0;
                                  user_position.total_cost_basis = 0.0;
-                                 // user_position.entry_average_price = 0.0; // <-- REMOVE
                              }
+                             
+                            final_position = user_position.clone();
+                        } // Mutable references are dropped here
+                        
+                        // --- Refactor Step 4: Log results and send updates --- 
+                        let display_avg_price = calculate_average_price(&final_position);
+                        let unrealized_pnl = calculate_unrealized_pnl(&final_position, final_price);
 
+                         println!(
+                            "-> Sell OK (Qty: {:.6}, Proceeds: {:.6}): Post {} (Supply: {:.6}, Price: {:.6}), User {} (Pos: {:.6}, Avg Prc: {:.6}, URPnl: {:.6}, Bal: {:.6}) RPnlTrade: {:.6}",
+                            quantity, trade_proceeds,
+                            post_id, new_supply, final_price, user_id, final_position.size, 
+                            display_avg_price, unrealized_pnl, final_balance, realized_pnl_for_trade
+                        );
 
-                             // --- Calculate Post-Trade State --- 
-                            let new_size = user_position.size;
-                            // Determine the average price to display
-                             let display_avg_price = calculate_average_price(&user_position);
-                             let actual_avg_price = calculate_average_price(&user_position); // For PNL calc
-                             let unrealized_pnl = calculate_unrealized_pnl(&user_position, final_price); // Use final price
-
-                             println!(
-                                "-> Sell OK (Qty: {:.6}, Proceeds: {:.6}): Post {} (Supply: {:.6}, Price: {:.6}), User {} (Pos: {:.6}, Avg Prc: {:.6}, URPnl: {:.6}, Bal: {:.6}) RPnlTrade: {:.6}",
-                                quantity, trade_proceeds,
-                                post_id, post.supply, final_price, user_id, new_size, 
-                                display_avg_price, // Log the displayed price
-                                // actual_avg_price, // Remove other avg price log
-                                unrealized_pnl, *user_balance, realized_pnl_for_trade
-                            );
-
-                            // --- Send Updates --- 
-                            send_to_client(client_id, ServerMessage::BalanceUpdate { balance: *user_balance }, state).await;
-                            if total_pnl_updated {
-                                let final_total_pnl = state.user_realized_pnl.get(user_id).map_or(0.0, |v| *v.value());
-                                send_to_client(client_id, ServerMessage::RealizedPnlUpdate { total_realized_pnl: final_total_pnl }, state).await;
-                            }
-                             send_to_client(client_id, ServerMessage::PositionUpdate {
-                                    post_id, size: new_size, 
-                                    average_price: display_avg_price.abs(), // Send the calculated display price
-                                    unrealized_pnl 
-                                 }, state).await;
-                            broadcast_market_and_position_updates(post_id, final_price, post.supply, client_id, state).await; // Use final price/supply
-
-                        } else {
-                            println!("-> Sell FAIL: Post {} not found", post_id);
-                            send_to_client(client_id, ServerMessage::Error { message: format!("Post {} not found", post_id) }, state).await;
+                        send_to_client(client_id, ServerMessage::BalanceUpdate { balance: final_balance }, state).await;
+                        if total_pnl_updated {
+                             send_to_client(client_id, ServerMessage::RealizedPnlUpdate { total_realized_pnl: final_total_realized_pnl }, state).await;
                         }
+                         send_to_client(client_id, ServerMessage::PositionUpdate {
+                                post_id, size: final_position.size, 
+                                average_price: display_avg_price.abs(),
+                                unrealized_pnl 
+                             }, state).await;
+                        let new_margin = calculate_user_margin(user_id, state);
+                        send_to_client(client_id, ServerMessage::MarginUpdate { margin: new_margin }, state).await;
+                        broadcast_market_and_position_updates(post_id, final_price, new_supply, client_id, state).await;
+
                     }
                 }
             }

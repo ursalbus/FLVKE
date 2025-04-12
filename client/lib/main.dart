@@ -89,6 +89,7 @@ abstract class ServerMessage {
         return UserSyncMessage(
             balance: (json['balance'] as num).toDouble(),
             total_realized_pnl: (json['total_realized_pnl'] as num? ?? 0.0).toDouble(),
+            margin: (json['margin'] as num).toDouble(),
             positions: positionsList,
         );
       case 'new_post':
@@ -110,6 +111,8 @@ abstract class ServerMessage {
         return RealizedPnlUpdateMessage(
           totalRealizedPnl: (json['total_realized_pnl'] as num).toDouble()
         );
+      case 'margin_update':
+        return MarginUpdateMessage(margin: (json['margin'] as num).toDouble());
       case 'error':
         return ErrorMessage(message: json['message'] as String);
       default:
@@ -158,13 +161,24 @@ class PositionUpdateMessage extends ServerMessage {
 class UserSyncMessage extends ServerMessage {
   final double balance;
   final double total_realized_pnl;
+  final double margin;
   final List<PositionDetail> positions;
-  const UserSyncMessage({required this.balance, required this.total_realized_pnl, required this.positions});
+  const UserSyncMessage({
+    required this.balance, 
+    required this.total_realized_pnl, 
+    required this.margin,
+    required this.positions
+  });
 }
 
 class RealizedPnlUpdateMessage extends ServerMessage {
   final double totalRealizedPnl;
   const RealizedPnlUpdateMessage({required this.totalRealizedPnl});
+}
+
+class MarginUpdateMessage extends ServerMessage {
+  final double margin;
+  const MarginUpdateMessage({required this.margin});
 }
 
 class UnknownMessage extends ServerMessage {
@@ -481,10 +495,12 @@ class AuthState extends ChangeNotifier {
 class BalanceState extends ChangeNotifier {
    double _balance = 1000.0; // Default initial balance
    double _totalRealizedPnl = 0.0; // Added
+   double _margin = 1000.0; // Added, initialize same as balance
    String? _error;
 
    double get balance => _balance;
    double get totalRealizedPnl => _totalRealizedPnl; // Added getter
+   double get margin => _margin; // Added getter
    String? get error => _error;
 
    void handleServerMessage(ServerMessage message) {
@@ -498,6 +514,10 @@ class BalanceState extends ChangeNotifier {
        if (_totalRealizedPnl != message.total_realized_pnl) {
             _totalRealizedPnl = message.total_realized_pnl;
             changed = true;
+       }
+       if (_margin != message.margin) {
+          _margin = message.margin;
+          changed = true;
        }
         print("BalanceState Synced: Bal: ${_balance.toStringAsFixed(4)}, RPnl: ${_totalRealizedPnl.toStringAsFixed(4)}");
      } else if (message is BalanceUpdateMessage) {
@@ -521,6 +541,13 @@ class BalanceState extends ChangeNotifier {
                print("BalanceState received error: ${message.message}");
                changed = true;
           }
+     } else if (message is MarginUpdateMessage) { // Added handler
+         if (_margin != message.margin) {
+             _margin = message.margin;
+             _error = null;
+             print("BalanceState updated: Margin: ${_margin.toStringAsFixed(4)}");
+             changed = true;
+         }
      }
 
      if (changed) {
@@ -872,6 +899,7 @@ class _TimelinePageState extends State<TimelinePage> {
 
     // Format currency
     final balanceFormatted = NumberFormat.currency(symbol: '\$', decimalDigits: 2).format(balanceState.balance);
+    final marginFormatted = NumberFormat.currency(symbol: '\$', decimalDigits: 2).format(balanceState.margin); // Format margin
     final rpnlFormatted = NumberFormat.currency(symbol: '\$', decimalDigits: 2).format(balanceState.totalRealizedPnl);
     final rpnlColor = balanceState.totalRealizedPnl >= 0 ? Colors.green[700] : Colors.red[700];
 
@@ -879,7 +907,7 @@ class _TimelinePageState extends State<TimelinePage> {
       appBar: AppBar(
         title: Text(
           // Example: Bal: $1000.00 | RPnl: $50.00 (WS: connected)
-          'Bal: $balanceFormatted | RPnl: ', 
+          'Bal: $balanceFormatted | Margin: $marginFormatted | RPnl: ', // Add Margin
           style: const TextStyle(fontSize: 14), 
         ),
          titleSpacing: 0, // Reduce spacing if title is long
