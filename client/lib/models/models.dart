@@ -1,0 +1,189 @@
+import 'package:meta/meta.dart'; // For @immutable
+import 'dart:math'; // For math operations used in PostDetail
+
+// --- Data Models (Matching Server) ---
+
+@immutable // Make models immutable
+class Post {
+  final String id; // Use String for UUIDs in Dart
+  final String userId;
+  final String content;
+  final DateTime timestamp;
+  final double price; // Server calculates and includes this
+  final double supply; // <-- Changed to double
+
+  const Post({
+    required this.id,
+    required this.userId,
+    required this.content,
+    required this.timestamp,
+    required this.price,
+    required this.supply,
+  });
+
+  // Factory constructor for JSON deserialization
+  factory Post.fromJson(Map<String, dynamic> json) {
+    return Post(
+      id: json['id'] as String,
+      userId: json['user_id'] as String,
+      content: json['content'] as String,
+      // Server sends ISO 8601 string
+      timestamp: DateTime.parse(json['timestamp'] as String),
+      // Server ensures price is sent
+      price: (json['price'] as num).toDouble(),
+      supply: (json['supply'] as num).toDouble(), // <-- Parse as num -> double
+    );
+  }
+}
+
+// Added PositionDetail class (matching server)
+@immutable
+class PositionDetail {
+  final String postId;
+  final double size; // <-- Changed to double
+  final double averagePrice;
+  final double unrealizedPnl;
+
+  const PositionDetail({
+    required this.postId,
+    required this.size,
+    required this.averagePrice,
+    required this.unrealizedPnl,
+  });
+
+  factory PositionDetail.fromJson(Map<String, dynamic> json) {
+    return PositionDetail(
+      postId: json['post_id'] as String,
+      size: (json['size'] as num).toDouble(), // <-- Parse as num -> double
+      averagePrice: (json['average_price'] as num).toDouble(),
+      unrealizedPnl: (json['unrealized_pnl'] as num).toDouble(),
+    );
+  }
+}
+
+// Represents messages received from the server
+@immutable
+abstract class ServerMessage {
+  const ServerMessage();
+
+  factory ServerMessage.fromJson(Map<String, dynamic> json) {
+    final type = json['type'] as String;
+    switch (type) {
+      case 'initial_state':
+        final postsList = (json['posts'] as List)
+            .map((postJson) => Post.fromJson(postJson as Map<String, dynamic>))
+            .toList();
+        return InitialStateMessage(posts: postsList);
+      case 'user_sync':
+        final positionsList = (json['positions'] as List)
+            .map((posJson) => PositionDetail.fromJson(posJson as Map<String, dynamic>))
+            .toList();
+        return UserSyncMessage(
+            balance: (json['balance'] as num).toDouble(),
+            total_realized_pnl: (json['total_realized_pnl'] as num? ?? 0.0).toDouble(),
+            margin: (json['margin'] as num).toDouble(),
+            positions: positionsList,
+        );
+      case 'new_post':
+        final post = Post.fromJson(json['post'] as Map<String, dynamic>);
+        return NewPostMessage(post: post);
+      case 'market_update':
+        return MarketUpdateMessage(
+          postId: json['post_id'] as String,
+          price: (json['price'] as num).toDouble(),
+          supply: (json['supply'] as num).toDouble() // <-- Parse as num -> double
+        );
+      case 'balance_update':
+        return BalanceUpdateMessage(balance: (json['balance'] as num).toDouble());
+      case 'position_update':
+        // Note: position_update messages might send the full PositionDetail directly
+        // Need to adjust if the server sends only partial updates for positions.
+        // Assuming server sends the full PositionDetail for now.
+         if (json.containsKey('post_id')) { // Check if it looks like a PositionDetail
+           return PositionUpdateMessage(
+               position: PositionDetail.fromJson(json)
+           );
+         } else {
+            // Handle unexpected format or log an error
+            print("Received position_update message with unexpected format: $json");
+            return UnknownMessage(type: type, data: json);
+         }
+      case 'realized_pnl_update':
+        return RealizedPnlUpdateMessage(
+          totalRealizedPnl: (json['total_realized_pnl'] as num).toDouble()
+        );
+      case 'margin_update':
+        return MarginUpdateMessage(margin: (json['margin'] as num).toDouble());
+      case 'error':
+        return ErrorMessage(message: json['message'] as String);
+      default:
+        print("Received unknown server message type: $type");
+        return UnknownMessage(type: type, data: json);
+    }
+  }
+}
+
+class InitialStateMessage extends ServerMessage {
+  final List<Post> posts;
+  const InitialStateMessage({required this.posts});
+}
+
+class NewPostMessage extends ServerMessage {
+  final Post post;
+  const NewPostMessage({required this.post});
+}
+
+class ErrorMessage extends ServerMessage {
+  final String message;
+  const ErrorMessage({required this.message});
+}
+
+class MarketUpdateMessage extends ServerMessage {
+  final String postId;
+  final double price;
+  final double supply; // <-- Changed to double
+  const MarketUpdateMessage({
+    required this.postId,
+    required this.price,
+    required this.supply
+  });
+}
+
+class BalanceUpdateMessage extends ServerMessage {
+  final double balance;
+  const BalanceUpdateMessage({required this.balance});
+}
+
+class PositionUpdateMessage extends ServerMessage {
+  final PositionDetail position;
+  const PositionUpdateMessage({required this.position});
+}
+
+class UserSyncMessage extends ServerMessage {
+  final double balance;
+  final double total_realized_pnl;
+  final double margin;
+  final List<PositionDetail> positions;
+  const UserSyncMessage({
+    required this.balance,
+    required this.total_realized_pnl,
+    required this.margin,
+    required this.positions
+  });
+}
+
+class RealizedPnlUpdateMessage extends ServerMessage {
+  final double totalRealizedPnl;
+  const RealizedPnlUpdateMessage({required this.totalRealizedPnl});
+}
+
+class MarginUpdateMessage extends ServerMessage {
+  final double margin;
+  const MarginUpdateMessage({required this.margin});
+}
+
+class UnknownMessage extends ServerMessage {
+   final String type;
+   final Map<String, dynamic> data;
+   const UnknownMessage({required this.type, required this.data});
+} 

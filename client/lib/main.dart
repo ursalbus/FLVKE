@@ -6,6 +6,17 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:intl/intl.dart'; // For date formatting
 import 'dart:math'; // For math operations
 
+// Import refactored components
+import 'constants.dart'; // For Supabase URL/Key (although ideally loaded from env)
+import 'models/models.dart';
+import 'state/auth_state.dart';
+import 'state/timeline_state.dart';
+import 'state/balance_state.dart';
+import 'state/position_state.dart';
+import 'services/websocket_service.dart';
+import 'screens/login_page.dart';
+import 'screens/timeline_page.dart';
+
 // --- Constants ---
 const String WEBSOCKET_URL = 'ws://localhost:8080/ws'; // Placeholder for server URL
 
@@ -587,40 +598,59 @@ class PositionState extends ChangeNotifier {
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // IMPORTANT: Replace with your Supabase URL and Anon Key
+  // TODO: Load these from environment variables instead of hardcoding
+  const supabaseUrl = String.fromEnvironment('SUPABASE_URL', defaultValue: 'https://ayjbspnnvjqhhbioeapo.supabase.co');
+  const supabaseAnonKey = String.fromEnvironment('SUPABASE_ANON_KEY', defaultValue: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF5amJzcG5udmpxaGhiaW9lYXBvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDQxMjY5NzQsImV4cCI6MjA1OTcwMjk3NH0.KkBaeBQrjfruaLRAXiLu9xvloCgAfjQe5FmEcf98djQ');
+
+  if (supabaseUrl.isEmpty || supabaseAnonKey.isEmpty) {
+     print("Error: SUPABASE_URL and SUPABASE_ANON_KEY environment variables are not set.");
+     // Potentially exit or show an error UI
+     return;
+  }
+
   await Supabase.initialize(
-    url: 'https://ayjbspnnvjqhhbioeapo.supabase.co',
-    anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF5amJzcG5udmpxaGhiaW9lYXBvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDQxMjY5NzQsImV4cCI6MjA1OTcwMjk3NH0.KkBaeBQrjfruaLRAXiLu9xvloCgAfjQe5FmEcf98djQ',
+    url: supabaseUrl,
+    anonKey: supabaseAnonKey,
   );
 
   runApp(
     MultiProvider(
       providers: [
+        // State Providers
         ChangeNotifierProvider(create: (_) => AuthState()),
         ChangeNotifierProvider(create: (_) => TimelineState()),
         ChangeNotifierProvider(create: (_) => BalanceState()),
-        ChangeNotifierProvider(create: (_) => PositionState()), // Provide PositionState
-        // Update ProxyProvider to include PositionState
+        ChangeNotifierProvider(create: (_) => PositionState()),
+
+        // WebSocket Service Provider (depends on states)
+        // It needs access to the state handlers (handleServerMessage)
         ChangeNotifierProxyProvider3<TimelineState, BalanceState, PositionState, WebSocketService>(
            create: (context) {
+              print("ProxyProvider creating initial WebSocketService...");
+              // Read the state providers WITHOUT listening
               final timelineState = context.read<TimelineState>();
               final balanceState = context.read<BalanceState>();
-              final positionState = context.read<PositionState>(); // Read PositionState
-              print("ProxyProvider creating initial WebSocketService with handlers");
+              final positionState = context.read<PositionState>();
+              // Create the WebSocketService, passing the message handlers
               return WebSocketService(onMessageReceivedHandlers: [
                   timelineState.handleServerMessage,
                   balanceState.handleServerMessage,
-                  positionState.handleServerMessage, // Add handler
+                  positionState.handleServerMessage,
               ]);
            },
            update: (context, timelineState, balanceState, positionState, previousWebSocketService) {
               print("ProxyProvider updating WebSocketService... Reusing previous: ${previousWebSocketService != null}");
-              // Reuse previous instance
-              return previousWebSocketService ?? WebSocketService(onMessageReceivedHandlers: [
-                 timelineState.handleServerMessage,
-                 balanceState.handleServerMessage,
-                 positionState.handleServerMessage, // Add handler
-              ]);
+              // This update function is primarily useful if WebSocketService needs to react
+              // to changes in the dependent states *after* creation. In this setup,
+              // the handlers are passed at creation, so we usually just return the existing service.
+              // If the handlers themselves needed to change based on state, logic would go here.
+              // Return the previous instance to avoid creating a new one unnecessarily.
+              return previousWebSocketService ??
+                  WebSocketService(onMessageReceivedHandlers: [
+                    timelineState.handleServerMessage,
+                    balanceState.handleServerMessage,
+                    positionState.handleServerMessage,
+                  ]);
             },
          ),
       ],
@@ -643,16 +673,47 @@ class MyApp extends StatelessWidget {
            bodyMedium: TextStyle(fontSize: 16.0),
            titleMedium: TextStyle(fontSize: 18.0, fontWeight: FontWeight.bold),
         ),
+        // Add input decoration theme for consistency
+        inputDecorationTheme: const InputDecorationTheme(
+           border: OutlineInputBorder(),
+           contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+        ),
+         // Add button themes for consistency
+        elevatedButtonTheme: ElevatedButtonThemeData(
+          style: ElevatedButton.styleFrom(
+            padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+          ),
+        ),
+        outlinedButtonTheme: OutlinedButtonThemeData(
+           style: OutlinedButton.styleFrom(
+            padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+          ),
+        ),
+        textButtonTheme: TextButtonThemeData(
+          style: TextButton.styleFrom(
+             padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+          )
+        )
       ),
+      // Use a Consumer or Selector for AuthState to determine the initial screen
       home: Consumer<AuthState>(
         builder: (context, authState, _) {
-          if (authState.user == null) {
-            return const LoginPage(); // Show login if not authenticated
+          // Check if user is authenticated
+          if (authState.user != null) {
+            // User is logged in, show TimelinePage
+            return const TimelinePage();
           } else {
-            return const TimelinePage(); // Show timeline if authenticated
+            // User is not logged in, show LoginPage
+            return const LoginPage();
           }
         },
       ),
+      // Optional: Define routes for navigation if needed later
+      // routes: {
+      //   '/login': (context) => const LoginPage(),
+      //   '/timeline': (context) => const TimelinePage(),
+      // },
+      // initialRoute: '/', // Determine initial route based on auth
     );
   }
 }
