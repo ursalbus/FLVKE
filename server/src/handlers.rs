@@ -243,10 +243,12 @@ async fn handle_buy(
     if old_size < -EPSILON { // Covering a short position
         let reduction_amount = quantity.min(old_size.abs());
         if reduction_amount > EPSILON {
-            let avg_short_basis_per_share = if old_size.abs() > EPSILON { old_position.total_cost_basis / old_size } else { 0.0 }; 
+            let avg_short_basis_per_share = if old_size.abs() > EPSILON { old_position.total_cost_basis / old_size } else { 0.0 }; // Basis is negative, size is negative -> positive avg price
             let cost_for_reduction = calculate_cost(current_supply, current_supply + reduction_amount);
+            // basis_change represents the magnitude of the basis removed (positive value)
             basis_change_for_short_cover = avg_short_basis_per_share * reduction_amount; 
-            realized_pnl_for_trade = -basis_change_for_short_cover - cost_for_reduction;
+            // Correct PnL = Proceeds (abs basis change) - Cost
+            realized_pnl_for_trade = basis_change_for_short_cover - cost_for_reduction;
             // PnL Print moved to inside lock
         }
     }
