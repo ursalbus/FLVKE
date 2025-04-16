@@ -8,8 +8,8 @@ use super::state::AppState;
 use super::models::{Client, ServerMessage, PositionDetail};
 use super::constants::{INITIAL_BALANCE, EPSILON};
 use super::bonding_curve::get_price;
-use super::calculations::{calculate_user_margin, calculate_average_price, calculate_unrealized_pnl};
-use super::handlers::handle_client_message;
+use super::calculations::{calculate_average_price, calculate_unrealized_pnl};
+use super::handlers::{calculate_total_unrealized_pnl, handle_client_message};
 
 // --- WebSocket Handling ---
 
@@ -23,7 +23,8 @@ pub fn message_type_for_debug(msg: &ServerMessage) -> &'static str {
        ServerMessage::BalanceUpdate { .. } => "BalanceUpdate",
        ServerMessage::PositionUpdate { .. } => "PositionUpdate",
        ServerMessage::RealizedPnlUpdate { .. } => "RealizedPnlUpdate",
-       ServerMessage::MarginUpdate { .. } => "MarginUpdate",
+       ServerMessage::ExposureUpdate { .. } => "ExposureUpdate",
+       ServerMessage::EquityUpdate { .. } => "EquityUpdate",
        ServerMessage::Error { .. } => "Error",
    }
 }
@@ -101,7 +102,7 @@ pub async fn broadcast_market_and_position_updates(
     };
     broadcast_message(market_update_msg, state).await;
 
-    // 2. Iterate through all ACTIVE clients to potentially send PNL and Margin updates
+    // 2. Iterate through all ACTIVE clients to potentially send PNL and Equity updates
     for client_entry in state.clients.iter() {
         let current_client_id = *client_entry.key();
         let client_info = client_entry.value();
@@ -112,32 +113,47 @@ pub async fn broadcast_market_and_position_updates(
             continue;
         }
 
+        let mut affected_by_price_change = false;
+
         // Check if this *other* user has a position in the updated post
          if let Some(user_positions_map) = state.user_positions.get(user_id) {
              if let Some(position) = user_positions_map.get(&post_id) {
                  // Only update if position exists and is non-zero
                  if position.size.abs() > EPSILON { 
                      let avg_price = calculate_average_price(&position);
-                     let updated_pnl = calculate_unrealized_pnl(&position, new_price);
+                     let updated_unrealized_pnl = calculate_unrealized_pnl(&position, new_price);
 
                      let position_update_msg = ServerMessage::PositionUpdate {
                          post_id,
                          size: position.size,
                          average_price: avg_price.abs(),
-                         unrealized_pnl: updated_pnl,
+                         unrealized_pnl: updated_unrealized_pnl,
                      };
                      println!(
-                         "   -> Sending PNL update for Post {} to OTHER User {} ({}): AvgPrc: {:.4}, PNL {:.4}",
-                         post_id, user_id, current_client_id, avg_price.abs(), updated_pnl
+                         "   -> Sending Position update for Post {} to OTHER User {} ({}): AvgPrc: {:.4}, URPnl {:.4}",
+                         post_id, user_id, current_client_id, avg_price.abs(), updated_unrealized_pnl
                      );
-                      send_to_client(current_client_id, position_update_msg, state).await;
-
-                     // Send Margin Update for the *other* user
-                     let other_user_margin = calculate_user_margin(user_id, state);
-                     send_to_client(current_client_id, ServerMessage::MarginUpdate { margin: other_user_margin }, state).await;
+                     send_to_client(current_client_id, position_update_msg, state).await;
+                     affected_by_price_change = true;
                  }
              }
          }
+
+        // If the user's PNL for this post changed, their overall Equity also changed.
+        // Send EquityUpdate. Exposure doesn't change from market moves, only trades.
+        if affected_by_price_change {
+            // Recalculate total equity for this user
+            let balance = state.user_balances.get(user_id).map_or(INITIAL_BALANCE, |b| *b.value());
+            let realized_pnl = state.user_realized_pnl.get(user_id).map_or(0.0, |pnl| *pnl.value());
+            let total_unrealized_pnl = calculate_total_unrealized_pnl(user_id, state);
+            let equity = balance + realized_pnl + total_unrealized_pnl;
+
+            println!(
+                "   -> Sending Equity update to OTHER User {} ({}): {:.4}",
+                 user_id, current_client_id, equity
+            );
+            send_to_client(current_client_id, ServerMessage::EquityUpdate { equity }, state).await;
+        }
     }
 }
 
@@ -150,6 +166,10 @@ pub async fn handle_connection(ws: WebSocket, user_id: String, state: AppState) 
 
     let (client_sender, client_rcv) = mpsc::unbounded_channel();
     let client_rcv_stream = UnboundedReceiverStream::new(client_rcv);
+
+    state.user_balances.entry(user_id.clone()).or_insert(INITIAL_BALANCE);
+    state.user_realized_pnl.entry(user_id.clone()).or_insert(0.0);
+    state.user_exposure.entry(user_id.clone()).or_insert(0.0);
 
     state.clients.insert(
         client_id,
@@ -177,10 +197,13 @@ pub async fn handle_connection(ws: WebSocket, user_id: String, state: AppState) 
     }
     println!("Sent InitialState to client_id={}", client_id);
 
-    // --- Send UserSync (Balance, Positions, Realized PNL, Margin) ---
-    let user_balance = *state.user_balances.entry(user_id.clone()).or_insert(INITIAL_BALANCE);
-    let total_realized_pnl = *state.user_realized_pnl.entry(user_id.clone()).or_insert(0.0);
-    let initial_margin = calculate_user_margin(&user_id, &state);
+    // --- Send UserSync (Balance, Exposure, Equity, PnL, Positions) ---
+    let user_balance = *state.user_balances.get(&user_id).unwrap().value();
+    let total_realized_pnl = *state.user_realized_pnl.get(&user_id).unwrap().value();
+    let user_exposure = *state.user_exposure.get(&user_id).unwrap().value();
+    let total_unrealized_pnl = calculate_total_unrealized_pnl(&user_id, &state);
+    let user_equity = user_balance + total_realized_pnl + total_unrealized_pnl;
+
     let user_positions_detail: Vec<PositionDetail> = state
         .user_positions
         .get(&user_id)
@@ -198,11 +221,12 @@ pub async fn handle_connection(ws: WebSocket, user_id: String, state: AppState) 
                     state.posts.get(&post_id).map(|market_post| {
                         let current_market_price = market_post.price.unwrap_or_else(|| get_price(market_post.supply));
                         let avg_price = calculate_average_price(position);
+                        let unrealized_pnl = calculate_unrealized_pnl(position, current_market_price);
                         PositionDetail {
                             post_id,
                             size: position.size,
                             average_price: avg_price.abs(),
-                            unrealized_pnl: calculate_unrealized_pnl(position, current_market_price),
+                            unrealized_pnl: unrealized_pnl,
                         }
                     })
                 })
@@ -211,8 +235,9 @@ pub async fn handle_connection(ws: WebSocket, user_id: String, state: AppState) 
         .unwrap_or_else(Vec::new);
 
     let user_sync_msg = ServerMessage::UserSync {
-        margin: initial_margin,
         balance: user_balance,
+        exposure: user_exposure,
+        equity: user_equity,
         positions: user_positions_detail,
         total_realized_pnl,
     };
@@ -221,7 +246,8 @@ pub async fn handle_connection(ws: WebSocket, user_id: String, state: AppState) 
          state.clients.remove(&client_id);
          return;
     }
-     println!("Sent UserSync to client_id={} (Bal: {:.4}, RPnl: {:.4})", client_id, user_balance, total_realized_pnl);
+     println!("Sent UserSync to client_id={} (Bal: {:.4}, RPnl: {:.4}, Exp: {:.4}, Equity: {:.4})",
+        client_id, user_balance, total_realized_pnl, user_exposure, user_equity);
 
     // --- WebSocket Task Setup ---
     let (ws_sender, mut ws_receiver) = ws.split();
@@ -229,9 +255,6 @@ pub async fn handle_connection(ws: WebSocket, user_id: String, state: AppState) 
     // Task to forward messages from MPSC channel to WebSocket sink
     tokio::spawn(async move {
        let task_client_id = client_id;
-        // NOTE: Removed SinkExt import, so changed forward to explicit loop
-       // Old: if let Err(e) = client_rcv_stream.forward(ws_sender).await {
-       // Now: 
        let mut ws_sender = ws_sender;
        let mut client_rcv_stream = client_rcv_stream;
        while let Some(message_result) = client_rcv_stream.next().await {

@@ -74,8 +74,9 @@ pub struct PositionDetail {
 pub enum ServerMessage {
     InitialState { posts: Vec<Post> },
     UserSync {
-        margin: f64,
         balance: f64,
+        exposure: f64,
+        equity: f64,
         positions: Vec<PositionDetail>,
         total_realized_pnl: f64,
     },
@@ -89,6 +90,7 @@ pub enum ServerMessage {
         unrealized_pnl: f64,
     },
     RealizedPnlUpdate { total_realized_pnl: f64 },
-    MarginUpdate { margin: f64 },
+    ExposureUpdate { exposure: f64 },
+    EquityUpdate { equity: f64 },
     Error { message: String },
 } 

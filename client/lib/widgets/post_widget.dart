@@ -144,35 +144,37 @@ class _PostWidgetState extends State<PostWidget> {
 
      // --- Button Disabling Logic ---
      // Ensure quantity is valid before checking balance/position
+     // Original check compared cost directly to balance.
+     // bool canBuy = _isQuantityValid && (_buyCost <= currentBalance);
+     // New server logic checks: exposure + change <= balance + realized_pnl
+     // Client-side check could approximate this but server is the source of truth.
+     // Keep simple balance check for now for basic UX, server will reject if needed.
      bool canBuy = _isQuantityValid && (_buyCost <= currentBalance);
-     // Can sell if: quantity is valid AND (user is long OR user has enough balance for sell operation)
-     // If user is long, they can always sell up to their position size.
-     // If user is flat or short, selling requires collateral (covered by balance check here)
-     // Note: Server will ultimately validate margin requirements.
-     // Let's simplify: Can sell if quantity is valid AND proceeds are calculable (which _isQuantityValid checks)
-     // AND (either they have a long position OR they have enough balance to cover potential negative proceeds - unlikely with this curve)
-     // The primary constraint for selling (going short) is margin, which isn't directly checked here yet.
-     // For now, we check if they have a long position OR if the *cost* of the operation (sellProceeds) can be covered by balance.
-     // This isn't perfect collateral check, but simpler for client-side estimate.
-     bool canSell = _isQuantityValid &&
-                    (currentPositionSize > EPSILON || // User is long enough to cover sell qty (approximate)
-                     _sellProceeds <= currentBalance // Or user has balance to cover the operation cost/collateral (approximate)
-                    );
-      // Let's refine canSell: You can always sell if you are long.
-      // If you are flat or short, you need sufficient balance to cover the *cost* of the operation.
-      // calculateBondingCurveCost(s_current, s_current - qty) should give the cost.
-      // If cost is negative (get money), always allowed (ignoring margin for now).
-      // If cost is positive (pay money), need balance.
-      // Let's recalculate sellCost explicitly for clarity
-      double sellCost = 0.0;
-      final quantity = double.tryParse(_quantityController.text.trim());
-      if (quantity != null && quantity > 0) {
-          sellCost = calculateBondingCurveCost(widget.post.supply, widget.post.supply - quantity);
-      }
 
-      canSell = _isQuantityValid &&
-                ( (currentPositionSize >= quantity! - EPSILON) || // Have enough existing position to sell
-                  (sellCost <= currentBalance) ); // Or enough balance to cover the cost of selling
+     // Can sell if: quantity is valid AND (user is long OR user has enough balance for sell operation - approximate check)
+     // If user is long, they can always sell up to their position size.
+     // If user is flat or short, selling requires collateral.
+     // The server validates: new_exposure <= balance + realized_pnl
+     // Client-side check here is an estimation.
+     // bool canSell = _isQuantityValid &&
+     //                (currentPositionSize > EPSILON || // User is long enough to cover sell qty (approximate)
+     //                 _sellProceeds <= currentBalance // Or user has balance to cover the operation cost/collateral (approximate)
+     //                );
+
+     // Refined canSell: You can always sell if you are long (enough to cover).
+     // If you are flat or short, need balance > cost if cost > 0.
+     // Cost calculated is calculateBondingCurveCost(s_current, s_current - qty).
+     // If cost is negative (get money), okay.
+     // If cost is positive (pay money), need balance.
+     double sellCost = 0.0;
+     final quantity = double.tryParse(_quantityController.text.trim());
+     if (quantity != null && quantity > 0) {
+         sellCost = calculateBondingCurveCost(widget.post.supply, widget.post.supply - quantity);
+     }
+
+     bool canSell = _isQuantityValid && quantity != null &&
+                ( (currentPositionSize >= quantity - EPSILON) || // Have enough existing position to sell
+                  (sellCost <= currentBalance) ); // Or enough balance to cover the (positive) cost of selling short
 
      // --- End Button Disabling Logic ---
 

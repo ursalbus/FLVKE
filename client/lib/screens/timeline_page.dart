@@ -178,50 +178,69 @@ class _TimelinePageState extends State<TimelinePage> {
     final balanceState = context.watch<BalanceState>(); // Watch for balance updates
     final timelineState = context.watch<TimelineState>(); // Watch for posts, loading, errors
 
-    // Format currency
-    final balanceFormatted = NumberFormat.currency(symbol: '\$', decimalDigits: 2).format(balanceState.balance);
-    final marginFormatted = NumberFormat.currency(symbol: '\$', decimalDigits: 2).format(balanceState.margin); // Format margin
-    final rpnlFormatted = NumberFormat.currency(symbol: '\$', decimalDigits: 2).format(balanceState.totalRealizedPnl);
+    // Format currency values
+    final numberFormat = NumberFormat.currency(symbol: '\$', decimalDigits: 2);
+    final equityFormatted = numberFormat.format(balanceState.equity);
+    final balanceFormatted = numberFormat.format(balanceState.balance);
+    final exposureFormatted = numberFormat.format(balanceState.exposure);
+    // final marginFormatted = numberFormat.format(balanceState.margin); // Removed
+    final rpnlFormatted = numberFormat.format(balanceState.totalRealizedPnl);
     final rpnlColor = balanceState.totalRealizedPnl >= 0 ? Colors.green[700] : Colors.red[700];
+
+    // Calculate exposure ratio for the progress bar
+    final availableCollateral = balanceState.balance + balanceState.totalRealizedPnl;
+    final exposureRatio = (availableCollateral > 0 && balanceState.exposure >= 0)
+        ? (balanceState.exposure / availableCollateral).clamp(0.0, 1.0)
+        : 0.0;
+    final exposureColor = exposureRatio > 0.8 ? Colors.orangeAccent : Colors.blueAccent;
 
     return Scaffold(
       appBar: AppBar(
-         title: FittedBox( // Ensure title fits
-           fit: BoxFit.scaleDown,
-           child: Text(
-             'Bal: $balanceFormatted | Margin: $marginFormatted | RPnl: ',
-             style: const TextStyle(fontSize: 14),
-           ),
-         ),
-         titleSpacing: 4.0, // Reduce spacing
-         actions: [
-             // Display RPnl colored
-             Padding(
-               padding: const EdgeInsets.symmetric(horizontal: 4.0),
-               child: Center(
-                 child: Text(
-                    rpnlFormatted,
-                    style: TextStyle(fontSize: 14, color: rpnlColor, fontWeight: FontWeight.bold)
+        // Use AppBar's bottom property for the summary and progress bar
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(40.0), // Adjust height as needed
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 4.0),
+            child: Column(
+              children: [
+                 // Row for key financial figures
+                 Wrap( // Use Wrap for better spacing on smaller screens
+                   spacing: 8.0, // Horizontal spacing
+                   runSpacing: 4.0, // Vertical spacing if wraps
+                   alignment: WrapAlignment.center,
+                   children: [
+                     _buildStatChip('Equity', equityFormatted),
+                     _buildStatChip('Balance', balanceFormatted),
+                     _buildStatChip('Exposure', exposureFormatted),
+                     _buildStatChip('RPnL', rpnlFormatted, rpnlColor),
+                   ],
                  ),
-               ),
-             ),
-             // Separator
-             const Padding(
-                padding: EdgeInsets.symmetric(horizontal: 4.0),
-                child: Text('|', style: TextStyle(fontSize: 14)),
-             ),
-             // WS Status
+                 const SizedBox(height: 4.0),
+                 // Exposure Indicator
+                 Tooltip(
+                    message: 'Exposure / (Balance + Realized PnL)',
+                    child: LinearProgressIndicator(
+                       value: exposureRatio,
+                       backgroundColor: Colors.grey[300],
+                       valueColor: AlwaysStoppedAnimation<Color>(exposureColor),
+                       minHeight: 6, // Make it a bit thicker
+                    ),
+                 ),
+              ],
+            ),
+          ),
+        ),
+        // Keep WS Status and Logout in actions
+        actions: [
              Padding(
-               padding: const EdgeInsets.symmetric(horizontal: 4.0),
+               padding: const EdgeInsets.symmetric(horizontal: 8.0),
                child: Center(child: Text('WS: ${wsStatus.name}', style: const TextStyle(fontSize: 14))), // Use status name
              ),
-            // Logout Button
            IconButton(
              icon: const Icon(Icons.logout),
              tooltip: 'Logout', // Add tooltip
              onPressed: () async {
-                // Consider showing confirmation dialog
-                context.read<WebSocketService>().disconnect(); // Disconnect WS on logout
+                context.read<WebSocketService>().disconnect();
                 await authState.signOut();
              },
            ),
@@ -249,6 +268,25 @@ class _TimelinePageState extends State<TimelinePage> {
         child: const Icon(Icons.add),
       ),
     );
+  }
+
+  // Helper widget to build styled stat chips for the AppBar
+  Widget _buildStatChip(String label, String value, [Color? valueColor]) {
+     return Chip(
+        padding: const EdgeInsets.symmetric(horizontal: 4.0, vertical: 0.0),
+        labelPadding: const EdgeInsets.symmetric(horizontal: 4.0),
+        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        label: Text(
+          '$label: $value',
+          style: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.bold,
+              color: valueColor,
+           ),
+        ),
+        backgroundColor: Colors.grey[200],
+        side: BorderSide(color: Colors.grey[400]!),
+     );
   }
 
   // Helper to build the error banner

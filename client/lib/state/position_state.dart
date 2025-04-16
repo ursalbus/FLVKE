@@ -22,13 +22,14 @@ class PositionState extends ChangeNotifier {
 
     if (message is UserSyncMessage) {
        final newPositions = { for (var p in message.positions) p.postId : p };
-       // Deep compare or simply check length/keys if performance is an issue
-       if (!_isSynced || _mapEquals(_positions, newPositions)) { // Need a map comparison helper
+       // Always update the position map on UserSync, as it represents the full state.
+       // Remove the complex and potentially buggy map comparison.
+       // if (!_isSynced || !_mapEquals(_positions, newPositions)) { 
            _positions = newPositions;
            _isSynced = true;
-           print("PositionState: Synced ${_positions.length} positions.");
+           print("PositionState: Synced/Updated ${_positions.length} positions from UserSync.");
            changed = true;
-       }
+       // }
     } else if (message is PositionUpdateMessage) {
        final postId = message.position.postId;
        // Remove position if size is near zero, otherwise update/add

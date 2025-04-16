@@ -19,7 +19,7 @@ use warp::{
 // Use items from modules
 use auth::with_auth;
 use errors::handle_rejection;
-use state::{AppState, Clients, Posts, UserBalances, UserPositions, UserRealizedPnl}; // Ensure all necessary state types are imported if used directly for default()
+use state::{AppState, Clients, Posts, UserBalances, UserPositions, UserRealizedPnl, UserExposure};
 use websocket::handle_connection;
 
 #[tokio::main]
@@ -39,6 +39,7 @@ async fn main() {
         user_balances: UserBalances::default(),
         user_positions: UserPositions::default(),
         user_realized_pnl: UserRealizedPnl::default(),
+        user_exposure: UserExposure::default(),
         jwt_secret: Arc::new(jwt_secret),
     };
 

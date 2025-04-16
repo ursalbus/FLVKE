@@ -80,8 +80,9 @@ abstract class ServerMessage {
             .toList();
         return UserSyncMessage(
             balance: (json['balance'] as num).toDouble(),
+            exposure: (json['exposure'] as num).toDouble(),
+            equity: (json['equity'] as num).toDouble(),
             total_realized_pnl: (json['total_realized_pnl'] as num? ?? 0.0).toDouble(),
-            margin: (json['margin'] as num).toDouble(),
             positions: positionsList,
         );
       case 'new_post':
@@ -96,24 +97,22 @@ abstract class ServerMessage {
       case 'balance_update':
         return BalanceUpdateMessage(balance: (json['balance'] as num).toDouble());
       case 'position_update':
-        // Note: position_update messages might send the full PositionDetail directly
-        // Need to adjust if the server sends only partial updates for positions.
-        // Assuming server sends the full PositionDetail for now.
-         if (json.containsKey('post_id')) { // Check if it looks like a PositionDetail
-           return PositionUpdateMessage(
-               position: PositionDetail.fromJson(json)
-           );
-         } else {
-            // Handle unexpected format or log an error
-            print("Received position_update message with unexpected format: $json");
-            return UnknownMessage(type: type, data: json);
-         }
+        if (json.containsKey('post_id')) { // Check if it looks like a PositionDetail
+          return PositionUpdateMessage(
+              position: PositionDetail.fromJson(json)
+          );
+        } else {
+          print("Received position_update message with unexpected format: $json");
+          return UnknownMessage(type: type, data: json);
+        }
       case 'realized_pnl_update':
         return RealizedPnlUpdateMessage(
           totalRealizedPnl: (json['total_realized_pnl'] as num).toDouble()
         );
-      case 'margin_update':
-        return MarginUpdateMessage(margin: (json['margin'] as num).toDouble());
+      case 'exposure_update':
+        return ExposureUpdateMessage(exposure: (json['exposure'] as num).toDouble());
+      case 'equity_update':
+        return EquityUpdateMessage(equity: (json['equity'] as num).toDouble());
       case 'error':
         return ErrorMessage(message: json['message'] as String);
       default:
@@ -161,13 +160,15 @@ class PositionUpdateMessage extends ServerMessage {
 
 class UserSyncMessage extends ServerMessage {
   final double balance;
+  final double exposure;
+  final double equity;
   final double total_realized_pnl;
-  final double margin;
   final List<PositionDetail> positions;
   const UserSyncMessage({
     required this.balance,
+    required this.exposure,
+    required this.equity,
     required this.total_realized_pnl,
-    required this.margin,
     required this.positions
   });
 }
@@ -177,9 +178,14 @@ class RealizedPnlUpdateMessage extends ServerMessage {
   const RealizedPnlUpdateMessage({required this.totalRealizedPnl});
 }
 
-class MarginUpdateMessage extends ServerMessage {
-  final double margin;
-  const MarginUpdateMessage({required this.margin});
+class ExposureUpdateMessage extends ServerMessage {
+  final double exposure;
+  const ExposureUpdateMessage({required this.exposure});
+}
+
+class EquityUpdateMessage extends ServerMessage {
+  final double equity;
+  const EquityUpdateMessage({required this.equity});
 }
 
 class UnknownMessage extends ServerMessage {
