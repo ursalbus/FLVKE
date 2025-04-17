@@ -282,8 +282,11 @@ async fn handle_buy(
         user_position.size += quantity;
 
         // --- Update Position Cost Basis ---
-        if old_size < -EPSILON {
-             user_position.total_cost_basis -= basis_change_for_short_cover; // basis_change is negative for short cover, so this adds
+        if old_size < -EPSILON { // Covering a short
+            // Basis change represents the magnitude of the basis removed (calculated as positive).
+            // Original short basis is negative. Add the positive magnitude to move towards zero.
+             user_position.total_cost_basis += basis_change_for_short_cover; // CORRECTED: Was -=
+             // Note: PnL for the cover is calculated and realized separately.
         }
 
         // If opening/increasing long, add the cost of the *newly opened* long portion
