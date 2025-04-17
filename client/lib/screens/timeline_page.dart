@@ -194,28 +194,33 @@ class _TimelinePageState extends State<TimelinePage> {
         : 0.0;
     final exposureColor = exposureRatio > 0.8 ? Colors.orangeAccent : Colors.blueAccent;
 
+    // Format the new value
+    final availableCollateralFormatted = numberFormat.format(availableCollateral);
+
     return Scaffold(
       appBar: AppBar(
         // Use AppBar's bottom property for the summary and progress bar
         bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(40.0), // Adjust height as needed
+          preferredSize: const Size.fromHeight(38.0), // Reduced height slightly
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 4.0),
+            padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 2.0), // Reduced vertical padding
             child: Column(
+              mainAxisAlignment: MainAxisAlignment.center, // Center content vertically
               children: [
                  // Row for key financial figures
                  Wrap( // Use Wrap for better spacing on smaller screens
-                   spacing: 8.0, // Horizontal spacing
-                   runSpacing: 4.0, // Vertical spacing if wraps
+                   spacing: 6.0, // Slightly reduced Horizontal spacing
+                   runSpacing: 1.0, // Reduced Vertical spacing if wraps
                    alignment: WrapAlignment.center,
                    children: [
                      _buildStatChip('Equity', equityFormatted),
                      _buildStatChip('Balance', balanceFormatted),
+                     _buildStatChip('Available Collateral', availableCollateralFormatted),
                      _buildStatChip('Exposure', exposureFormatted),
                      _buildStatChip('RPnL', rpnlFormatted, rpnlColor),
                    ],
                  ),
-                 const SizedBox(height: 4.0),
+                 // const SizedBox(height: 4.0), // Removing SizedBox or making it smaller
                  // Exposure Indicator
                  Tooltip(
                     message: 'Exposure / (Balance + Realized PnL)',
@@ -273,8 +278,8 @@ class _TimelinePageState extends State<TimelinePage> {
   // Helper widget to build styled stat chips for the AppBar
   Widget _buildStatChip(String label, String value, [Color? valueColor]) {
      return Chip(
-        padding: const EdgeInsets.symmetric(horizontal: 4.0, vertical: 0.0),
-        labelPadding: const EdgeInsets.symmetric(horizontal: 4.0),
+        padding: const EdgeInsets.symmetric(horizontal: 3.0, vertical: 0.0), // Reduced padding
+        labelPadding: const EdgeInsets.symmetric(horizontal: 3.0), // Reduced padding
         materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
         label: Text(
           '$label: $value',
