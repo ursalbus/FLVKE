@@ -116,10 +116,14 @@ async fn send_user_sync_update(user_id: &str, client_id: Uuid, state: &AppState)
        // For now, we continue and will send UserSync with empty positions.
     }
 
-    // --- Process collected positions (might be empty if panic occurred) --- 
+    // --- Process collected positions --- 
     println!("send_user_sync_update: Processing collected positions (count: {})...", collected_positions.len());
     let mut position_details = Vec::new();
     let mut total_unrealized_pnl = 0.0;
+
+    // Need user's balance and rpnl for liquidation calc
+    let user_balance_for_liq = state.user_balances.get(user_id).map_or(INITIAL_BALANCE, |v| *v.value());
+    let user_rpnl_for_liq = state.user_realized_pnl.get(user_id).map_or(0.0, |v| *v.value());
 
     for (post_id, position_value) in collected_positions {
         println!("send_user_sync_update: Processing collected position for post {}", post_id);
@@ -132,17 +136,28 @@ async fn send_user_sync_update(user_id: &str, client_id: Uuid, state: &AppState)
              let avg_price = calculate_average_price(&position_value);
              if position_value.size.abs() > EPSILON {
                 let unrealized_pnl = calculate_unrealized_pnl(&position_value, current_market_price);
-                println!("send_user_sync_update: Post {}, AvgPrc={:.4}, uPnL={:.4}. Adding detail.", post_id, avg_price, unrealized_pnl);
-                total_unrealized_pnl += unrealized_pnl;
-                position_details.push(super::models::PositionDetail {
-                    post_id,
+                println!("send_user_sync_update: Post {}, AvgPrc={:.4}, uPnL={:.4}. Calculating liq supply...", post_id, avg_price, unrealized_pnl);
+                    total_unrealized_pnl += unrealized_pnl;
+
+                // Calculate liquidation supply for this position
+                let liquidation_supply = calculate_liquidation_supply(
+                    user_balance_for_liq, 
+                    user_rpnl_for_liq, 
+                    position_value.size, 
+                    avg_price
+                );
+                println!("send_user_sync_update: Post {}, LiqSupply={:?}. Adding detail.", post_id, liquidation_supply);
+
+                    position_details.push(super::models::PositionDetail {
+                        post_id,
                     size: position_value.size,
                     average_price: avg_price,
-                    unrealized_pnl,
-                });
+                        unrealized_pnl,
+                    liquidation_supply, // Add the calculated value
+                    });
              } else {
                 println!("send_user_sync_update: Post {}, Size near zero, skipping detail.", post_id);
-             }
+                 }
         } else {
             eprintln!("Warning: Post {} disappeared while processing collected UserSync data for user {}", post_id, user_id);
         }
@@ -609,7 +624,7 @@ async fn update_liquidation_thresholds(post_id: Uuid, state: &AppState) {
             } else {
                 println!("update_liquidation_thresholds: User {}: No liquidation supply calculated.", user_id);
             }
-        } else {
+         } else {
             println!("update_liquidation_thresholds: User {} has no position on post {}.", user_id, post_id);
         }
     }

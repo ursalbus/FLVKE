@@ -40,23 +40,29 @@ pub fn calculate_liquidation_supply(
     position_size: f64,
     average_entry_price: f64,
 ) -> Option<f64> {
+    println!("  calculate_liquidation_supply: Inputs: bal={:.4}, rpnl={:.4}, size={:.4}, avg_prc={:.4}", balance, total_realized_pnl, position_size, average_entry_price);
     if position_size.abs() < EPSILON {
+        println!("  calculate_liquidation_supply: No position, returning None.");
         return None; // No position, no liquidation threshold
     }
 
     let collateral = balance + total_realized_pnl;
+    println!("  calculate_liquidation_supply: Collateral = {:.4}", collateral);
 
     // Target price P(s_liq) where equity = 0
     // collateral + (P(s_liq) - average_entry_price) * position_size = 0
     // P(s_liq) = average_entry_price - collateral / position_size
     // Avoid division by zero edge case although checked earlier
-    if position_size.abs() < EPSILON { return None; }
+    if position_size.abs() < EPSILON { println!("  calculate_liquidation_supply: Position size zero check 2, returning None."); return None; }
     let target_price = average_entry_price - collateral / position_size;
+    println!("  calculate_liquidation_supply: Calculated target_price = {:.6}", target_price);
 
     // Price must be positive
     if target_price <= 0.0 + BONDING_CURVE_EPSILON { // Add epsilon for safety
+        println!("  calculate_liquidation_supply: target_price <= 0, returning None.");
         return None; // Liquidation would require non-positive price, impossible
     }
+    println!("  calculate_liquidation_supply: target_price > 0. Proceeding to find supply...");
 
     // Now find supply 's' such that P(s) = target_price
     if (target_price - 1.0).abs() < BONDING_CURVE_EPSILON {

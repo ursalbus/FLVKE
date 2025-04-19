@@ -8,7 +8,7 @@ use super::state::AppState;
 use super::models::{Client, ServerMessage, PositionDetail};
 use super::constants::{INITIAL_BALANCE, EPSILON};
 use super::bonding_curve::get_price;
-use super::calculations::{calculate_average_price, calculate_unrealized_pnl};
+use super::calculations::{calculate_average_price, calculate_unrealized_pnl, calculate_liquidation_supply};
 use super::handlers::{calculate_total_unrealized_pnl, handle_client_message};
 
 // --- WebSocket Handling ---
@@ -222,11 +222,21 @@ pub async fn handle_connection(ws: WebSocket, user_id: String, state: AppState) 
                         let current_market_price = market_post.price.unwrap_or_else(|| get_price(market_post.supply));
                         let avg_price = calculate_average_price(position);
                         let unrealized_pnl = calculate_unrealized_pnl(position, current_market_price);
+                        
+                        // Calculate liquidation supply here too
+                        let liquidation_supply = calculate_liquidation_supply(
+                            user_balance, // Use fetched balance
+                            total_realized_pnl, // Use fetched rpnl
+                            position.size, 
+                            avg_price
+                        );
+
                         PositionDetail {
                             post_id,
                             size: position.size,
                             average_price: avg_price.abs(),
                             unrealized_pnl: unrealized_pnl,
+                            liquidation_supply, // Add field
                         }
                     })
                 })

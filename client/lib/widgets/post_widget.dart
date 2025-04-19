@@ -407,6 +407,12 @@ class _PostWidgetState extends State<PostWidget> {
       final formattedUnrealizedPnl = NumberFormat.currency(symbol: r'$', decimalDigits: 2).format(positionDetail.unrealizedPnl);
       final pnlColor = positionDetail.unrealizedPnl >= 0 ? Colors.green : Colors.red;
 
+      // Format liquidation supply if available
+      String? formattedLiqSupply;
+      if (positionDetail.liquidationSupply != null) {
+          formattedLiqSupply = positionDetail.liquidationSupply!.toStringAsFixed(4);
+      }
+
        return Padding(
          padding: const EdgeInsets.only(top: 4.0, bottom: 4.0),
          child: Column(
@@ -421,6 +427,15 @@ class _PostWidgetState extends State<PostWidget> {
                      'Unrealized P&L: $formattedUnrealizedPnl',
                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: pnlColor),
                  ),
+                 // Conditionally display Liquidation Supply
+                 if (formattedLiqSupply != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2.0), // Add a little space
+                      child: Text(
+                        'Liq. Supply: $formattedLiqSupply',
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.orange[700]), // Use a distinct color
+                      ),
+                    ),
                  const Divider(),
              ],
          ),

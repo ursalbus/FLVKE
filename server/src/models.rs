@@ -80,6 +80,8 @@ pub struct PositionDetail {
     pub size: f64,
     pub average_price: f64,
     pub unrealized_pnl: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liquidation_supply: Option<f64>,
 }
 
 // Represents messages sent from the server to the client
