@@ -2,7 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart' hide AuthState;
 import 'package:provider/provider.dart';
 
-// Import refactored components
+// Import themes and states
+import 'theme.dart';
+import 'state/theme_state.dart';
 import 'state/auth_state.dart';
 import 'state/timeline_state.dart';
 import 'state/balance_state.dart';
@@ -48,6 +50,7 @@ Future<void> main() async {
         ChangeNotifierProvider(create: (_) => TimelineState()),
         ChangeNotifierProvider(create: (_) => BalanceState()),
         ChangeNotifierProvider(create: (_) => PositionState()),
+        ChangeNotifierProvider(create: (_) => ThemeState()), // Provide ThemeState
 
         // WebSocket Service Provider (depends on states for message handlers)
         ChangeNotifierProxyProvider3<TimelineState, BalanceState, PositionState, WebSocketService>(
@@ -75,7 +78,12 @@ Future<void> main() async {
             // Provider automatically handles calling dispose on ChangeNotifiers like WebSocketService
          ),
       ],
-      child: const MyApp(),
+      // Use Consumer<ThemeState> to rebuild MaterialApp when theme changes
+      child: Consumer<ThemeState>(
+        builder: (context, themeState, _) {
+          return const MyApp(); // MyApp itself doesn't need themeState directly
+        }
+      ),
     ),
   );
 }
@@ -85,65 +93,15 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // Get the theme data once to avoid repeated lookups
-    final theme = Theme.of(context);
+    // Get the theme state to determine the mode
+    final themeState = Provider.of<ThemeState>(context);
 
     return MaterialApp(
       title: 'FLVKE',
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
-        useMaterial3: true,
-        textTheme: const TextTheme(
-           bodyMedium: TextStyle(fontSize: 16.0),
-           titleMedium: TextStyle(fontSize: 18.0, fontWeight: FontWeight.bold),
-           bodySmall: TextStyle(fontSize: 12.0),
-           titleSmall: TextStyle(fontSize: 14.0, fontWeight: FontWeight.w500) // Slightly bolder titleSmall
-        ),
-        inputDecorationTheme: const InputDecorationTheme(
-           border: OutlineInputBorder(),
-           isDense: true,
-           contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        ),
-        elevatedButtonTheme: ElevatedButtonThemeData(
-          style: ElevatedButton.styleFrom(
-            padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 14),
-          ),
-        ),
-        outlinedButtonTheme: OutlinedButtonThemeData(
-           style: OutlinedButton.styleFrom(
-             padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 14),
-             // Use theme.colorScheme to access generated colors if needed AFTER theme is built
-             // Using a static color or context lookup might be safer here initially
-             side: BorderSide(color: Colors.deepPurple), // Example: Use seed color directly
-          ),
-        ),
-        textButtonTheme: TextButtonThemeData(
-          style: TextButton.styleFrom(
-             padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 14),
-          )
-        ),
-        cardTheme: CardTheme(
-           elevation: 2,
-           margin: const EdgeInsets.symmetric(vertical: 8.0, horizontal: 12.0),
-           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8.0)),
-        ),
-         appBarTheme: AppBarTheme(
-            elevation: 1,
-            // Using ColorScheme directly can be verbose, consider defining colors elsewhere
-            backgroundColor: ColorScheme.fromSeed(seedColor: Colors.deepPurple).surface,
-            foregroundColor: ColorScheme.fromSeed(seedColor: Colors.deepPurple).onSurface,
-            titleSpacing: NavigationToolbar.kMiddleSpacing,
-            // Use a predefined text style or define explicitly
-            titleTextStyle: const TextStyle(
-                fontSize: 20, // Example: Consistent AppBar title size
-                fontWeight: FontWeight.w500,
-                color: Colors.black // Example: Ensure color contrast
-            ),
-         ),
-         snackBarTheme: const SnackBarThemeData(
-            behavior: SnackBarBehavior.floating,
-         ),
-      ),
+      theme: lightTheme, // Use light theme data from theme.dart
+      darkTheme: darkTheme, // Use dark theme data from theme.dart
+      themeMode: themeState.themeMode, // Control theme mode via state
+
       home: Consumer<AuthState>(
         builder: (context, authState, _) {
           if (authState?.user != null && authState?.accessToken != null) {

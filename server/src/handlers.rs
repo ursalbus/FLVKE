@@ -1,12 +1,18 @@
 use chrono::Utc;
 use uuid::Uuid;
 use warp::filters::ws::Message;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use ordered_float::OrderedFloat;
+use tokio::time::Instant;
 
-use super::state::AppState;
+use super::state::{AppState, UserPositions, UserBalances, UserRealizedPnl, Posts, LiquidationThresholds};
 use super::models::{ClientMessage, ServerMessage, Post, UserPositionDetail};
 use super::constants::{EPSILON, INITIAL_BALANCE};
-use super::bonding_curve::{get_price, calculate_cost};
-use super::calculations::{calculate_average_price, calculate_unrealized_pnl};
+use super::bonding_curve::{get_price, calculate_smooth_cost};
+use super::calculations::{
+    calculate_average_price, calculate_unrealized_pnl, calculate_liquidation_supply,
+    EffectiveTradeResult, calculate_effective_cost_and_final_supply
+};
 use super::websocket::{send_to_client, broadcast_message, broadcast_market_and_position_updates};
 
 // Helper function to initialize user state if it doesn't exist
@@ -16,6 +22,7 @@ fn ensure_user_state_exists(user_id: &str, state: &AppState) {
     state.user_realized_pnl.entry(user_id.to_string()).or_insert(0.0);
     // Initialize stored exposure
     state.user_exposure.entry(user_id.to_string()).or_insert(0.0);
+    // Ensure liquidation threshold map exists for posts (handled in update func)
 }
 
 // Helper function to calculate total unrealized PNL for a user
@@ -26,92 +33,201 @@ pub fn calculate_total_unrealized_pnl(user_id: &str, state: &AppState) -> f64 {
             let post_id = position_entry.key();
             let position = position_entry.value();
             if let Some(post) = state.posts.get(post_id) {
-                if let Some(current_price) = post.price {
+                // Use the post's stored price if available, otherwise calculate
+                let current_price = post.price.unwrap_or_else(|| get_price(post.supply));
                     total_urpnl += calculate_unrealized_pnl(position, current_price);
-                }
             }
         }
     }
     total_urpnl
 }
 
+// Helper function to calculate total exposure for a user
+// Exposure = Sum of absolute value of cost basis for all positions
+pub fn calculate_total_exposure(user_id: &str, state: &AppState) -> f64 {
+    let mut total_exposure = 0.0;
+    if let Some(user_positions) = state.user_positions.get(user_id) {
+        for position_entry in user_positions.iter() {
+            let position = position_entry.value();
+            // Use abs() because basis can be negative for shorts
+            total_exposure += position.total_cost_basis.abs(); 
+        }
+    }
+    total_exposure
+}
+
 // Helper function to send a comprehensive user state update
 async fn send_user_sync_update(user_id: &str, client_id: Uuid, state: &AppState) {
+    println!("--- Entering send_user_sync_update for User {} (Client {}) ---", user_id, client_id);
+    // Fetch potentially updated values
+    println!("send_user_sync_update: Fetching balance...");
     let balance = state.user_balances.get(user_id).map_or(INITIAL_BALANCE, |v| *v.value());
+    println!("send_user_sync_update: Fetching realized_pnl...");
     let realized_pnl = state.user_realized_pnl.get(user_id).map_or(0.0, |v| *v.value());
-    // Read stored exposure
+    println!("send_user_sync_update: Fetching exposure...");
     let exposure = state.user_exposure.get(user_id).map_or(0.0, |v| *v.value());
+    println!("send_user_sync_update: Bal={:.4}, RPnl={:.4}, Exp={:.4}. Preparing to collect position data...", balance, realized_pnl, exposure);
 
+    // --- Collect position data safely --- 
+    let mut collected_positions = Vec::new();
+    let mut collection_error: Option<String> = None;
+
+    // Catch potential panics during position access
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        println!("send_user_sync_update: Inside catch_unwind - Attempting state.user_positions.get()...");
+        let mut temp_positions = Vec::new();
+        if let Some(user_positions_map_ref) = state.user_positions.get(user_id) {
+            println!("send_user_sync_update: Inside catch_unwind - Got map reference. Iterating...");
+            for entry in user_positions_map_ref.iter() {
+                // Clone necessary data: post_id and UserPositionDetail
+                temp_positions.push((*entry.key(), entry.value().clone()));
+            }
+             println!("send_user_sync_update: Inside catch_unwind - Collected {} positions for user {}.", temp_positions.len(), user_id);
+        } else {
+             println!("send_user_sync_update: Inside catch_unwind - No positions map found for user {}.", user_id);
+        }
+        temp_positions // Return the collected data if successful
+    }));
+
+    match result {
+        Ok(positions) => {
+            println!("send_user_sync_update: catch_unwind succeeded. Using collected positions.");
+            collected_positions = positions;
+        }
+        Err(panic_payload) => {
+            // Log the panic
+            let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                *s
+            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                s.as_str()
+            } else {
+                "Unknown panic type"
+            };
+            eprintln!("CRITICAL PANIC CAUGHT in send_user_sync_update while accessing user_positions for user {}: {}", user_id, panic_msg);
+            collection_error = Some(format!("Panic accessing position data: {}", panic_msg));
+            // collected_positions remains empty
+        }
+    }
+    
+    // If collection failed (panic or otherwise), we might still want to send a partial UserSync
+    if let Some(err_msg) = collection_error {
+       eprintln!("send_user_sync_update: Error occurred during position collection: {}", err_msg);
+       // Optionally, send an error message to the client or a UserSync with empty positions?
+       // For now, we continue and will send UserSync with empty positions.
+    }
+
+    // --- Process collected positions (might be empty if panic occurred) --- 
+    println!("send_user_sync_update: Processing collected positions (count: {})...", collected_positions.len());
     let mut position_details = Vec::new();
     let mut total_unrealized_pnl = 0.0;
 
-    if let Some(user_positions_map) = state.user_positions.get(user_id) {
-        for entry in user_positions_map.iter() {
-            let post_id = *entry.key();
-            let position = entry.value();
-            if let Some(post) = state.posts.get(&post_id) {
-                 if let Some(current_price) = post.price {
-                    let unrealized_pnl = calculate_unrealized_pnl(position, current_price);
-                    total_unrealized_pnl += unrealized_pnl;
-                    position_details.push(super::models::PositionDetail {
-                        post_id,
-                        size: position.size,
-                        average_price: calculate_average_price(position),
-                        unrealized_pnl,
-                    });
-                 }
-            }
+    for (post_id, position_value) in collected_positions {
+        println!("send_user_sync_update: Processing collected position for post {}", post_id);
+        let current_market_price = state.posts.get(&post_id)
+            .map_or(0.0, |p| p.value().price.unwrap_or(0.0));
+        println!("send_user_sync_update: Post {}, MarketPrice={:.4}, PosSize={:.4}. Calculating PnL...", post_id, current_market_price, position_value.size);
+
+        // Post existence check might be less critical now, but still good practice
+        if let Some(_post) = state.posts.get(&post_id) { 
+             let avg_price = calculate_average_price(&position_value);
+             if position_value.size.abs() > EPSILON {
+                let unrealized_pnl = calculate_unrealized_pnl(&position_value, current_market_price);
+                println!("send_user_sync_update: Post {}, AvgPrc={:.4}, uPnL={:.4}. Adding detail.", post_id, avg_price, unrealized_pnl);
+                total_unrealized_pnl += unrealized_pnl;
+                position_details.push(super::models::PositionDetail {
+                    post_id,
+                    size: position_value.size,
+                    average_price: avg_price,
+                    unrealized_pnl,
+                });
+             } else {
+                println!("send_user_sync_update: Post {}, Size near zero, skipping detail.", post_id);
+             }
+        } else {
+            eprintln!("Warning: Post {} disappeared while processing collected UserSync data for user {}", post_id, user_id);
         }
     }
+    println!("send_user_sync_update: Finished processing collected positions. Total uPnL={:.4}", total_unrealized_pnl);
 
     let equity = balance + realized_pnl + total_unrealized_pnl;
+    println!("send_user_sync_update: Calculated Equity={:.4}. Constructing message...", equity);
 
     let sync_msg = ServerMessage::UserSync {
         balance,
-        exposure, // Use stored exposure
+        exposure,
         equity,
         positions: position_details,
         total_realized_pnl: realized_pnl,
     };
-    send_to_client(client_id, sync_msg, state).await;
+    println!("send_user_sync_update: Message constructed. Serializing...");
+
+    // Find the client sender to send the message
+    // Check if client is still connected before sending
+    if let Some(client_entry) = state.clients.get(&client_id) {
+        let client = client_entry.value();
+        if client.user_id == user_id { // Double check user_id match
+           println!("send_user_sync_update: Found client entry for {}. Serializing JSON...", client_id);
+           match serde_json::to_string(&sync_msg) {
+               Ok(msg_str) => {
+                   println!("send_user_sync_update: Serialized OK. Sending via MPSC channel...");
+                   if let Err(e) = client.sender.send(Ok(warp::filters::ws::Message::text(msg_str))) {
+                        eprintln!("Error sending UserSync to client {}: {}", client_id, e);
+                   }
+                   println!("send_user_sync_update: Sent via MPSC channel (or queued).");
+               },
+               Err(e) => {
+                    // Log serialization error - this could be a source of panic if unhandled floats exist
+                    eprintln!("Critical Error: Failed to serialize UserSync for user {}: {}. Message: {:?}", user_id, e, sync_msg);
+                    // Consider sending an error message instead? Or just logging.
+               }
+           }
+        } else {
+            eprintln!("Error: Client ID {} does not match User ID {} during UserSync send.", client_id, user_id);
+        }
+    } else {
+        println!("send_user_sync_update: Client {} not found (offline?). Skipping send.", client_id);
+    }
+    println!("--- Exiting send_user_sync_update for User {} (Client {}) ---", user_id, client_id);
 }
 
 pub async fn handle_client_message(
     client_id: Uuid,
     user_id: &str,
-    msg: Message,
+    msg: warp::filters::ws::Message,
     state: &AppState,
 ) {
-    // Ensure user state exists before handling any message
     ensure_user_state_exists(user_id, state);
-
     if let Ok(text) = msg.to_str() {
         match serde_json::from_str::<ClientMessage>(text) {
             Ok(client_msg) => {
-                 println!(
-                    "User {} ({}) request: {:?}",
-                    user_id, client_id, client_msg
-                );
-
+                println!("User {} ({}) request: {:?}", user_id, client_id, client_msg);
                 match client_msg {
                     ClientMessage::CreatePost { content } => {
-                        handle_create_post(client_id, user_id, content, state).await;
+                        println!("handle_client_message: Calling handle_create_post...");
+                        let new_post_id = handle_create_post(client_id, user_id, content, state).await;
+                        println!("handle_client_message: Returned from handle_create_post. Calling update_liquidation_thresholds...");
+                        update_liquidation_thresholds(new_post_id, state).await;
+                        println!("handle_client_message: Returned from update_liquidation_thresholds after CreatePost.");
                     }
                     ClientMessage::Buy { post_id, quantity } => {
+                        println!("handle_client_message: Calling handle_buy...");
                         handle_buy(client_id, user_id, post_id, quantity, state).await;
-                        // Send a full sync after the operation
-                        send_user_sync_update(user_id, client_id, state).await;
+                        println!("handle_client_message: Returned from handle_buy. Calling update_liquidation_thresholds...");
+                        update_liquidation_thresholds(post_id, state).await;
+                        println!("handle_client_message: Returned from update_liquidation_thresholds after Buy.");
                     }
                      ClientMessage::Sell { post_id, quantity } => {
+                        println!("handle_client_message: Calling handle_sell...");
                         handle_sell(client_id, user_id, post_id, quantity, state).await;
-                        // Send a full sync after the operation
-                        send_user_sync_update(user_id, client_id, state).await;
+                        println!("handle_client_message: Returned from handle_sell. Calling update_liquidation_thresholds...");
+                        update_liquidation_thresholds(post_id, state).await;
+                        println!("handle_client_message: Returned from update_liquidation_thresholds after Sell.");
                     }
                 }
             }
             Err(e) => {
-                eprintln!("Deserialize error for client_id={}: {}, err={}", client_id, text, e);
-                send_to_client(client_id, ServerMessage::Error { message: format!("Invalid message format: {}", e) }, state).await;
+                 // Also log deserialization errors
+                 eprintln!("Error deserializing client message from {}: {}. Raw text: '{}'", client_id, e, text);
             }
         }
     } else if msg.is_ping() {
@@ -124,11 +240,11 @@ pub async fn handle_client_message(
 }
 
 async fn handle_create_post(
-    _client_id: Uuid, // Not strictly needed for create post logic itself
+    _client_id: Uuid,
     user_id: &str,
     content: String,
     state: &AppState,
-) {
+) -> Uuid {
     let new_post_id = Uuid::new_v4();
     let initial_price = get_price(0.0);
     let new_post = Post {
@@ -138,7 +254,10 @@ async fn handle_create_post(
         timestamp: Utc::now(),
         supply: 0.0,
         price: Some(initial_price),
+        // Removed old fields
     };
+    // Ensure threshold map exists for the new post, even if empty
+    state.liquidation_thresholds.insert(new_post_id, BTreeMap::new());
     state.posts.insert(new_post_id, new_post.clone());
     println!(
         "-> Post {} created (Price: {:.6}, Supply: 0.0)",
@@ -146,436 +265,377 @@ async fn handle_create_post(
     );
     let broadcast_msg = ServerMessage::NewPost { post: new_post };
     broadcast_message(broadcast_msg, state).await;
+    new_post_id
 }
 
 async fn handle_buy(
     client_id: Uuid,
-    user_id: &str,
+    trader_user_id: &str,
     post_id: Uuid,
     quantity: f64,
     state: &AppState,
 ) {
      if quantity <= EPSILON {
-        println!("-> Buy FAIL: Quantity {} must be positive", quantity);
         send_to_client(client_id, ServerMessage::Error { message: format!("Buy quantity ({:.6}) must be positive", quantity) }, state).await;
         return;
     }
+    ensure_user_state_exists(trader_user_id, state);
 
-    ensure_user_state_exists(user_id, state); // Ensure state exists before trade
-
-    // --- Read needed state (minimal locking) ---
-    let maybe_post_data = state.posts.get(&post_id).map(|p| (p.supply, p.price));
-    let current_balance = *state.user_balances.get(user_id).unwrap().value();
-    let current_realized_pnl = *state.user_realized_pnl.get(user_id).unwrap().value();
-    let current_exposure = *state.user_exposure.get(user_id).unwrap().value();
-    let user_position_val = state.user_positions.get(user_id)
-        .and_then(|positions| positions.get(&post_id).map(|pos_detail| pos_detail.clone()));
-
-    // --- Perform checks and calculations ---
-    let (current_supply, current_price_opt) = match maybe_post_data {
-        Some((supply, price_opt)) => (supply, price_opt),
-        None => {
-            println!("-> Buy FAIL: Post {} not found", post_id);
-            send_to_client(client_id, ServerMessage::Error { message: format!("Post {} not found", post_id) }, state).await;
-            return;
-        }
+    // --- Phase 1: Read Initial State & Calculate Effective Trade ---
+    let initial_supply = match state.posts.get(&post_id) {
+        Some(post_entry) => post_entry.supply,
+        None => { send_to_client(client_id, ServerMessage::Error { message: format!("Post {} not found", post_id) }, state).await; return; }
     };
-    let price_at_trade_start = current_price_opt.unwrap_or_else(|| get_price(current_supply));
-    let new_supply = current_supply + quantity;
-    let trade_cost = calculate_cost(current_supply, new_supply);
-    if trade_cost.is_nan() {
-        println!("-> Buy FAIL: Cost calculation resulted in NaN (Supplies: {} -> {})", current_supply, new_supply);
-        send_to_client(client_id, ServerMessage::Error { message: "Internal error calculating trade cost.".to_string() }, state).await;
+
+    let trade_result = match calculate_effective_cost_and_final_supply(initial_supply, quantity, post_id, state) {
+        Ok(result) => result,
+        Err(e) => { send_to_client(client_id, ServerMessage::Error { message: format!("Trade calculation error: {}", e) }, state).await; return; }
+    };
+
+    // --- Phase 2: Collateral Check ---
+    let balance = state.user_balances.get(trader_user_id).map_or(INITIAL_BALANCE, |v| *v.value());
+    let realized_pnl = state.user_realized_pnl.get(trader_user_id).map_or(0.0, |v| *v.value());
+    let available_collateral = balance + realized_pnl;
+
+    // Note: Simplified check
+    if trade_result.effective_cost > available_collateral + EPSILON {
+        send_to_client(client_id, ServerMessage::Error { message: format!("Insufficient collateral {:.6}. Available: {:.6}", trade_result.effective_cost, available_collateral) }, state).await;
         return;
     }
 
-    // --- Calculate Change in Exposure (Cost Basis Method) ---
-    let old_position = user_position_val.unwrap_or_default();
-    let old_size = old_position.size;
-    let mut delta_exposure = 0.0;
+    // --- Phase 3: Atomic State Updates ---
+    let mut affected_user_ids = HashSet::new();
+    affected_user_ids.insert(trader_user_id.to_string());
 
-    if old_size < -EPSILON { // Covering a short
-        let reduction_amount = quantity.min(old_size.abs());
-        if reduction_amount > EPSILON {
-            let avg_short_basis_per_share = if old_size.abs() > EPSILON { old_position.total_cost_basis / old_size } else { 0.0 };
-            let exposure_reduction = reduction_amount * avg_short_basis_per_share.abs();
-            delta_exposure -= exposure_reduction; // Apply reduction directly
-            println!(
-                "   -> Exposure Change (Buy Cover): Reducing exposure by {:.6} (Reduction: {:.6}, Avg Short Basis/Share: {:.6})",
-                exposure_reduction, reduction_amount, avg_short_basis_per_share
-            );
-        }
-    }
-
-    // Check if the buy opens/increases a long position
-    if old_size >= -EPSILON { // Started flat or long
-        delta_exposure += trade_cost.abs();
-        println!(
-            "   -> Exposure Change (Buy Open/Increase Long): Increasing exposure by {:.6} (Trade Cost: {:.6})",
-            trade_cost.abs(), trade_cost
-        );
-    } else if quantity > old_size.abs() { // Covered short AND opened long
-        let supply_at_zero_crossing = current_supply + old_size.abs();
-        let cost_for_long_part = calculate_cost(supply_at_zero_crossing, new_supply);
-        delta_exposure += cost_for_long_part.abs();
-         println!(
-            "   -> Exposure Change (Buy Open Long Part): Increasing exposure by {:.6} (Cost for Long Part: {:.6})",
-            cost_for_long_part.abs(), cost_for_long_part
-        );
-    }
-
-    // --- Potential Exposure Check ---
-    let potential_exposure_after_trade = current_exposure + delta_exposure;
-    let available_collateral = current_balance + current_realized_pnl;
-    if potential_exposure_after_trade > available_collateral + EPSILON { 
-         println!(
-            "-> Buy FAIL: User {} Insufficient Collateral for Potential Exposure. Required Exposure: {:.6}, Current Exposure: {:.6}, Delta: {:.6}, Available Collateral: {:.6}",
-            user_id, potential_exposure_after_trade, current_exposure, delta_exposure, available_collateral
-        );
-        send_to_client(client_id, ServerMessage::Error { message: format!("Insufficient collateral for potential exposure {:.6}. Available: {:.6}", potential_exposure_after_trade, available_collateral) }, state).await;
-        return;
-    }
-    // --- End Potential Exposure Check ---
-
-    // --- PnL Calculation ---
-    let mut realized_pnl_for_trade = 0.0;
-    let mut basis_change_for_short_cover = 0.0;
-    if old_size < -EPSILON { // Covering a short position
-        let reduction_amount = quantity.min(old_size.abs());
-        if reduction_amount > EPSILON {
-            let avg_short_basis_per_share = if old_size.abs() > EPSILON { old_position.total_cost_basis / old_size } else { 0.0 }; // Basis is negative, size is negative -> positive avg price
-            let cost_for_reduction = calculate_cost(current_supply, current_supply + reduction_amount);
-            // basis_change represents the magnitude of the basis removed (positive value)
-            basis_change_for_short_cover = avg_short_basis_per_share * reduction_amount; 
-            // Correct PnL = Proceeds (abs basis change) - Cost
-            realized_pnl_for_trade = basis_change_for_short_cover - cost_for_reduction;
-            // PnL Print moved to inside lock
-        }
-    }
-
-    // --- Acquire locks and update state ---
     let final_price;
-    let final_position;
-    let final_total_realized_pnl;
-    let final_exposure;
+    let final_supply = trade_result.final_supply;
 
-    { // Scope for mutable references
-        // --- Update Post State ---
-        let mut post_entry = match state.posts.get_mut(&post_id) {
-             Some(entry) => entry,
-             None => return, // Should not happen due to earlier check, but good practice
-         };
-         let post = &mut *post_entry;
-         post.supply = new_supply;
-         final_price = get_price(new_supply);
-         post.price = Some(final_price);
+    // --- Update Post --- 
+    match state.posts.get_mut(&post_id) {
+        Some(mut post_entry) => {
+            println!("    - Updating Post {}: Initial Supply = {:.6}, Calculated Final Supply = {:.6}", post_id, post_entry.supply, final_supply);
+            let supply_before_update = post_entry.supply; // Store pre-update value for logging
+            post_entry.supply = final_supply;
+            final_price = get_price(final_supply);
+            post_entry.price = Some(final_price);
+            println!("    - Post {} updated: Supply Before = {:.6}, Supply After = {:.6}, Final Price = {:.6}", post_id, supply_before_update, post_entry.supply, final_price);
+        },
+        None => { eprintln!("Critical Error: Post {} disappeared during trade processing.", post_id); return; }
+    }
 
-        // --- Update User Balance (NO CHANGE) ---
-        // Balance represents lifetime deposits/withdrawals, not affected by trading cost/proceeds.
-        // let mut balance_entry = state.user_balances.entry(user_id.to_string()).or_insert(INITIAL_BALANCE);
-        // *balance_entry -= trade_cost; // REMOVED
-        // final_balance = *balance_entry;
+    // --- Update Trader State --- 
+    let trader_rpnl_change = -trade_result.effective_cost; 
+    println!("handle_buy: Updating trader state...");
+    { // Scope for user_positions access
+        let mut trader_pos_map = state.user_positions.entry(trader_user_id.to_string()).or_default();
+        let mut trader_pos = trader_pos_map.entry(post_id).or_default();
 
-        // --- Update User Position ---
-        let user_positions_for_user = state.user_positions.entry(user_id.to_string()).or_default();
-        let mut user_position = user_positions_for_user.entry(post_id).or_insert_with(UserPositionDetail::default);
-        user_position.size += quantity;
+        trader_pos.size += quantity;
+        trader_pos.total_cost_basis += trade_result.effective_cost; // Simplification
+        println!("handle_buy: Updated trader position: Size={:.4}, Basis={:.4}", trader_pos.size, trader_pos.total_cost_basis);
 
-        // --- Update Position Cost Basis ---
-        if old_size < -EPSILON {
-             user_position.total_cost_basis -= basis_change_for_short_cover; // basis_change is negative for short cover, so this adds
+        if trader_pos.size.abs() < EPSILON {
+            trader_pos.size = 0.0;
+            trader_pos.total_cost_basis = 0.0;
+            println!("handle_buy: Trader position size near zero, reset basis.");
         }
+    } // Locks on user_positions released here
+    println!("handle_buy: Finished user_positions update scope.");
 
-        // If opening/increasing long, add the cost of the *newly opened* long portion
-        if old_size >= -EPSILON { // Started flat or long
-            user_position.total_cost_basis += trade_cost;
-            println!("   -> Adding Long Basis (Flat/Long Start): Cost: {:.6}, Total Basis: {:.6}",
-                    trade_cost, user_position.total_cost_basis);
-        } else if quantity > old_size.abs() { // Covered short AND opened long
-            // Only add the cost associated with the part that *opens* the long position
-            let long_opening_quantity = quantity - old_size.abs();
-            let supply_at_zero_crossing = current_supply + old_size.abs(); // Supply when position becomes 0
-            let cost_for_long_part = calculate_cost(supply_at_zero_crossing, new_supply);
-            user_position.total_cost_basis += cost_for_long_part;
-            println!("   -> Adding Long Basis (Short Cover + Open Long): Qty: {:.6}, Cost for Long Part (Supply {:.6} -> {:.6}): {:.6}, Total Basis: {:.6}",
-                    long_opening_quantity, supply_at_zero_crossing, new_supply, cost_for_long_part, user_position.total_cost_basis);
-        }
+    { // Scope for user_realized_pnl access
+         println!("handle_buy: Updating user_realized_pnl...");
+        state.user_realized_pnl.entry(trader_user_id.to_string())
+            .and_modify(|rpnl| *rpnl += trader_rpnl_change)
+            .or_insert(trader_rpnl_change);
+         println!("handle_buy: user_realized_pnl updated by {:.4}.", trader_rpnl_change);
+    } // Lock on user_realized_pnl released here
+     println!("handle_buy: Finished user_realized_pnl update scope.");
 
-        // --- Update Realized PNL ---
-        if realized_pnl_for_trade.abs() > EPSILON {
-            println!(
-                "   -> Realizing PNL (Buy Cover): {:.6} for User {}",
-                realized_pnl_for_trade, user_id
-            );
-            let mut total_pnl = state.user_realized_pnl.entry(user_id.to_string()).or_insert(0.0);
-            *total_pnl += realized_pnl_for_trade;
-            final_total_realized_pnl = *total_pnl;
+    // Update Trader Exposure 
+    let new_total_exposure = calculate_total_exposure(trader_user_id, state);
+    state.user_exposure.insert(trader_user_id.to_string(), new_total_exposure);
+    println!("handle_buy: Updated trader exposure to {:.4}.", new_total_exposure);
+
+    println!("handle_buy: Updating liquidated users (if any)...");
+    // --- Update Liquidated Users --- 
+    for (liquidated_user_id, forced_trade_pnl) in &trade_result.liquidated_users {
+        println!("   - Processing state update for liquidated user: {}", liquidated_user_id);
+        affected_user_ids.insert(liquidated_user_id.clone());
+        let mut liq_pos_removed = false;
+
+        if let Some(mut liq_pos_map) = state.user_positions.get_mut(liquidated_user_id) {
+             if liq_pos_map.remove(&post_id).is_some() {
+                 liq_pos_removed = true;
+                 println!("     - Removed position for post {}", post_id);
+             } else {
+                 println!("     - Warning: Position for post {} not found for liquidated user {}.", post_id, liquidated_user_id);
+             }
         } else {
-            final_total_realized_pnl = *state.user_realized_pnl.get(user_id).unwrap().value(); // Assumes exists due to ensure_user_state_exists
+            println!("     - Warning: Position map not found for liquidated user {}.", liquidated_user_id);
         }
 
-        // --- Update Stored Exposure ---
-        let mut exposure_entry = state.user_exposure.entry(user_id.to_string()).or_insert(0.0);
-        *exposure_entry += delta_exposure; // Apply calculated change
-         // Ensure exposure doesn't go negative due to float issues
-        if *exposure_entry < 0.0 { *exposure_entry = 0.0; }
-        final_exposure = *exposure_entry;
+        if liq_pos_removed { // Only update PnL if position was confirmed removed
+            state.user_realized_pnl.entry(liquidated_user_id.clone())
+                .and_modify(|rpnl| *rpnl += forced_trade_pnl)
+                .or_insert(*forced_trade_pnl);
+            println!("     - Updated RPnL by {:.4}", forced_trade_pnl);
+        } 
+        
+        // Reset exposure (simplistic)
+        state.user_exposure.entry(liquidated_user_id.clone()).and_modify(|exp| *exp = 0.0).or_insert(0.0);
+        println!("     - Reset exposure for user {}", liquidated_user_id);
+    }
+    println!("handle_buy: Finished updating liquidated users.");
 
-        // --- Cleanup near-zero positions ---
-         if user_position.size.abs() < EPSILON {
-             println!("   -> Position size is near zero ({:.8}) after trade, resetting basis and size.", user_position.size);
-             user_position.size = 0.0;
-             user_position.total_cost_basis = 0.0;
-         }
+    // --- Phase 4: Post-Trade Updates & Broadcasts ---
+    // Thresholds update is now called from handle_client_message AFTER the handler returns
 
-        final_position = user_position.clone();
-
-    } // Mutable references are dropped here
-
-    // --- Log results ---
-    let current_balance_for_log = state.user_balances.get(user_id).map_or(0.0, |v| *v.value());
-
-     println!(
-        "-> Buy OK (Qty: {:.6}, Cost: {:.6}): Post {} (Supply: {:.6}, Prc: {:.6}), User {} (Pos: {:.6}, RPnlTrade: {:.6}, Bal: {:.6}, TotRPnl: {:.6}, FinalExp: {:.6})",
-        quantity, trade_cost, post_id, new_supply, final_price, user_id, final_position.size,
-        realized_pnl_for_trade,
-        current_balance_for_log, final_total_realized_pnl, final_exposure
+    // Log Results
+            println!(
+        "-> Buy OK (Qty: {:.6}, EffCost: {:.6}): Post {} -> Supply: {:.6}, Prc: {:.6}. Liqs: {}",
+        quantity, trade_result.effective_cost, post_id, final_supply, final_price, trade_result.liquidated_users.len()
     );
 
-    // --- Send Granular Updates (Optional - covered by send_user_sync_update below) ---
-    // send_to_client(client_id, ServerMessage::BalanceUpdate { balance: final_balance }, state).await; // Balance doesn't change per trade
-    // send_to_client(client_id, ServerMessage::RealizedPnlUpdate { total_realized_pnl: final_total_realized_pnl }, state).await;
-    // send_to_client(client_id, ServerMessage::ExposureUpdate { exposure: final_exposure }, state).await;
-    // send_to_client(client_id, ServerMessage::PositionUpdate {
-    //     post_id, size: final_position.size,
-    //     average_price: calculate_average_price(&final_position), // Send signed avg price? Or always positive? Let's keep positive.
-    //     calculate_unrealized_pnl(&final_position, final_price)
-    //  }, state).await;
-    // let equity = current_balance_for_log + final_total_realized_pnl + calculate_total_unrealized_pnl(user_id, state);
-    // send_to_client(client_id, ServerMessage::EquityUpdate { equity }, state).await;
+    // Broadcast Market Updates 
+    println!("handle_buy: Broadcasting market updates...");
+    broadcast_market_and_position_updates(post_id, final_price, final_supply, client_id, state).await;
+    println!("handle_buy: Returned from market update broadcast.");
 
-    // Remove old margin update
-    // let new_margin = calculate_user_margin(user_id, state);
-    // send_to_client(client_id, ServerMessage::MarginUpdate { margin: new_margin }, state).await;
+    // Send UserSync Updates to all affected users
+    println!("handle_buy: Preparing UserSync client map...");
+    let client_map: HashMap<String, Uuid> = state.clients.iter()
+        .map(|entry| (entry.value().user_id.clone(), *entry.key()))
+        .collect();
+    println!("handle_buy: Client map created (size: {}). Sending UserSync updates...", client_map.len());
 
-    // --- Broadcast Market and Position Updates (Needs review) ---
-    // This broadcasts market state and potentially *other* users' position updates if they hold the same post.
-    // We might not need to broadcast individual position updates widely, only market updates.
-    // The send_user_sync_update called after this handler will update the acting user's state.
-    broadcast_market_and_position_updates(post_id, final_price, new_supply, client_id, state).await;
-
-    // Note: send_user_sync_update will be called after this function returns in handle_client_message
+    for user_id in affected_user_ids {
+        if let Some(affected_client_id) = client_map.get(&user_id) {
+            println!("   - Sending UserSync update to affected User {} (Client {})", user_id, affected_client_id);
+            let state_clone = state.clone(); 
+            let user_id_clone = user_id.clone();
+            let affected_client_id_clone = *affected_client_id;
+            // Add a small delay before accessing state again in send_user_sync_update
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+            send_user_sync_update(&user_id_clone, affected_client_id_clone, &state_clone).await;
+             println!("   - Returned from send_user_sync_update for User {} (Client {})", user_id, affected_client_id);
+        } else {
+            println!("   - Skipping UserSync update for User {} (offline?)", user_id);
+        }
+    }
+    println!("handle_buy: Finished sending UserSync updates loop. Returning from handle_buy normally.");
 }
 
 async fn handle_sell(
     client_id: Uuid,
-    user_id: &str,
+    trader_user_id: &str,
     post_id: Uuid,
     quantity: f64,
     state: &AppState,
 ) {
-     if quantity <= EPSILON {
-         println!("-> Sell FAIL: Quantity {} must be positive", quantity);
-        send_to_client(client_id, ServerMessage::Error { message: format!("Sell quantity ({:.6}) must be positive", quantity) }, state).await;
-        return;
-    }
+    if quantity <= EPSILON { send_to_client(client_id, ServerMessage::Error { message: "Sell quantity must be positive".to_string() }, state).await; return; }
+    let trade_quantity = -quantity; // Internal representation
+    ensure_user_state_exists(trader_user_id, state);
 
-    ensure_user_state_exists(user_id, state); // Ensure state exists before trade
-
-    // --- Read needed state (minimal locking) ---
-    let maybe_post_data = state.posts.get(&post_id).map(|p| (p.supply, p.price));
-    let current_balance = *state.user_balances.get(user_id).unwrap().value();
-    let current_realized_pnl = *state.user_realized_pnl.get(user_id).unwrap().value();
-    let current_exposure = *state.user_exposure.get(user_id).unwrap().value();
-    let user_position_val = state.user_positions.get(user_id)
-        .and_then(|positions| positions.get(&post_id).map(|pos_detail| pos_detail.clone()));
-
-    // --- Perform checks and calculations ---
-    let (current_supply, _) = match maybe_post_data {
-        Some((supply, price_opt)) => (supply, price_opt),
-        None => {
-            println!("-> Sell FAIL: Post {} not found", post_id);
-            send_to_client(client_id, ServerMessage::Error { message: format!("Post {} not found", post_id) }, state).await;
-            return;
-        }
+    // --- Phase 1: Read Initial State & Calculate Effective Trade ---
+    let initial_supply = match state.posts.get(&post_id) { 
+        Some(post_entry) => post_entry.supply, 
+        None => { send_to_client(client_id, ServerMessage::Error { message: format!("Post {} not found", post_id) }, state).await; return; }
     };
-    let new_supply = current_supply - quantity;
-    let trade_proceeds = calculate_cost(new_supply, current_supply);
-    if trade_proceeds.is_nan() { // Proceeds should be non-negative
-        println!(
-            "-> Sell FAIL: Proceeds calculation invalid (Supplies: {} -> {}, Proceeds: {})",
-            current_supply, new_supply, trade_proceeds
-        );
-        send_to_client(client_id, ServerMessage::Error { message: "Internal error calculating trade proceeds.".to_string() }, state).await;
+    let trade_result = match calculate_effective_cost_and_final_supply(initial_supply, trade_quantity, post_id, state) { 
+        Ok(result) => result, 
+        Err(e) => { send_to_client(client_id, ServerMessage::Error { message: format!("Trade calculation error: {}", e) }, state).await; return; }
+    };
+
+    // --- Phase 2: Collateral & Position Checks ---
+    let balance = state.user_balances.get(trader_user_id).map_or(INITIAL_BALANCE, |v| *v.value());
+    let realized_pnl = state.user_realized_pnl.get(trader_user_id).map_or(0.0, |v| *v.value());
+    let available_collateral = balance + realized_pnl;
+
+    if trade_result.effective_cost > available_collateral + EPSILON { 
+        send_to_client(client_id, ServerMessage::Error { message: format!("Insufficient collateral {:.6}. Available: {:.6}", trade_result.effective_cost, available_collateral) }, state).await; 
         return;
     }
 
-    let old_position = user_position_val.unwrap_or_default();
-    let old_size = old_position.size;
-
-    // --- Calculate Change in Exposure (Cost Basis Method) ---
-    let mut delta_exposure = 0.0;
-
-    if old_size > EPSILON { // Closing out a long position
-        let reduction_amount = quantity.min(old_size);
-        if reduction_amount > EPSILON {
-            let avg_long_basis_per_share = if old_size.abs() > EPSILON { old_position.total_cost_basis / old_size } else { 0.0 };
-            let exposure_reduction = reduction_amount * avg_long_basis_per_share.abs();
-            delta_exposure -= exposure_reduction; // Apply reduction directly
-            println!(
-                "   -> Exposure Change (Sell Close Long): Reducing exposure by {:.6} (Reduction: {:.6}, Avg Long Basis/Share: {:.6})",
-                exposure_reduction, reduction_amount, avg_long_basis_per_share
-            );
-        }
-    }
-
-    // Check if the sell opens/increases a short position
-    if old_size <= EPSILON { // Started flat or short
-        delta_exposure += trade_proceeds.abs();
-        println!(
-            "   -> Exposure Change (Sell Open/Increase Short): Increasing exposure by {:.6} (Trade Proceeds: {:.6})",
-            trade_proceeds.abs(), trade_proceeds
-        );
-    } else if quantity > old_size { // Closed long AND opened short
-        let supply_at_zero_crossing = current_supply - old_size;
-        let proceeds_for_short_part = calculate_cost(new_supply, supply_at_zero_crossing);
-        delta_exposure += proceeds_for_short_part.abs();
-        println!(
-            "   -> Exposure Change (Sell Open Short Part): Increasing exposure by {:.6} (Proceeds for Short Part: {:.6})",
-            proceeds_for_short_part.abs(), proceeds_for_short_part
-        );
-    }
-
-    // --- Potential Exposure Check ---
-    let potential_exposure_after_trade = current_exposure + delta_exposure;
-    let available_collateral = current_balance + current_realized_pnl;
-    if potential_exposure_after_trade > available_collateral + EPSILON {
-         println!(
-            "-> Sell FAIL: User {} Insufficient Collateral for Potential Exposure. Required Exposure: {:.6}, Current Exposure: {:.6}, Delta: {:.6}, Available Collateral: {:.6}",
-            user_id, potential_exposure_after_trade, current_exposure, delta_exposure, available_collateral
-        );
-        send_to_client(client_id, ServerMessage::Error { message: format!("Insufficient collateral for potential exposure {:.6}. Available: {:.6}", potential_exposure_after_trade, available_collateral) }, state).await;
+    let current_position_size = state.user_positions.get(trader_user_id)
+        .and_then(|m| m.get(&post_id).map(|p| p.size))
+        .unwrap_or(0.0);
+    if current_position_size < quantity - EPSILON { // Selling more than held long
+        send_to_client(client_id, ServerMessage::Error { message: format!("Insufficient position to sell {:.6}. Held: {:.6}", quantity, current_position_size) }, state).await; 
         return;
     }
-    // --- End Potential Exposure Check ---
 
-    // --- PnL Calculation ---
-    let mut realized_pnl_for_trade = 0.0;
-    let mut basis_removed = 0.0; // Basis change when closing long
-    if old_size > EPSILON { // Closing out a long position
-        let reduction_amount = quantity.min(old_size);
-        if reduction_amount > EPSILON {
-            let avg_long_basis_per_share = if old_size.abs() > EPSILON { old_position.total_cost_basis / old_size } else { 0.0 };
-            let proceeds_for_reduction = calculate_cost(current_supply - reduction_amount, current_supply);
-            basis_removed = avg_long_basis_per_share * reduction_amount;
-            realized_pnl_for_trade = proceeds_for_reduction - basis_removed;
-            // PnL Print moved to inside lock
-        }
-    }
-
-    // --- Acquire locks and update state ---
+    // --- Phase 3: Atomic State Updates (similar scoping as handle_buy) --- 
+    let mut affected_user_ids = HashSet::new();
+    affected_user_ids.insert(trader_user_id.to_string());
     let final_price;
-    let final_position;
-    let final_total_realized_pnl;
-    let final_exposure;
+    let final_supply = trade_result.final_supply;
 
-    { // Scope for mutable references
-        // --- Update Post State ---
-        let mut post_entry = match state.posts.get_mut(&post_id) {
-             Some(entry) => entry,
-             None => return, // Should not happen
-         };
-         let post = &mut *post_entry;
-         post.supply = new_supply;
-         final_price = get_price(new_supply);
-         post.price = Some(final_price);
+    // Update Post (scope implicitly handled by get_mut)
+    match state.posts.get_mut(&post_id) { 
+         Some(mut post_entry) => {
+            println!("    - Updating Post {}: Initial Supply = {:.6}, Calculated Final Supply = {:.6}", post_id, post_entry.supply, final_supply);
+            let supply_before_update = post_entry.supply; 
+            post_entry.supply = final_supply;
+            final_price = get_price(final_supply);
+            post_entry.price = Some(final_price);
+            println!("    - Post {} updated: Supply Before = {:.6}, Supply After = {:.6}, Final Price = {:.6}", post_id, supply_before_update, post_entry.supply, final_price);
+        },
+        None => { eprintln!("Critical Error: Post {} disappeared during trade processing.", post_id); return; }
+    }; 
 
-        // --- Update User Balance (NO CHANGE) ---
-        // Balance represents lifetime deposits/withdrawals, not affected by trading cost/proceeds.
-        // let mut balance_entry = state.user_balances.entry(user_id.to_string()).or_insert(INITIAL_BALANCE);
-        // *balance_entry += trade_proceeds; // REMOVED
-        // final_balance = *balance_entry;
+    // Update Trader State with scopes
+    let trader_rpnl_change = -trade_result.effective_cost; // Proceeds = -Cost
+    println!("handle_sell: Updating trader state...");
+    {
+        let mut trader_pos_map = state.user_positions.entry(trader_user_id.to_string()).or_default();
+        let mut trader_pos = trader_pos_map.entry(post_id).or_default();
+        let old_size = trader_pos.size;
+        trader_pos.size += trade_quantity; // trade_quantity is negative for sell
+        trader_pos.total_cost_basis += trade_result.effective_cost;
+        println!("handle_sell: Updated trader position: OldSize={:.4}, NewSize={:.4}, BasisChange={:.4}", old_size, trader_pos.size, trade_result.effective_cost);
 
-        // --- Update User Position ---
-        let user_positions_for_user = state.user_positions.entry(user_id.to_string()).or_default();
-        let mut user_position = user_positions_for_user.entry(post_id).or_insert_with(UserPositionDetail::default);
-        user_position.size -= quantity;
-
-        // --- Update Position Cost Basis ---
-        if old_size > EPSILON { 
-             user_position.total_cost_basis -= basis_removed;
-             println!(
-                "   -> Selling long: Pnl: {:.6}", // Log PnL here
-                 realized_pnl_for_trade
-             );
-         }
-        if old_size <= EPSILON { 
-            user_position.total_cost_basis -= trade_proceeds; 
-        } else if quantity > old_size { 
-            let supply_at_zero_crossing = current_supply - old_size; 
-            let proceeds_for_short_part = calculate_cost(new_supply, supply_at_zero_crossing); 
-            user_position.total_cost_basis -= proceeds_for_short_part;
+        // Check if position closed and reset basis
+        if trader_pos.size.abs() < EPSILON {
+            println!("handle_sell: Trader position size near zero ({:.6}), resetting basis.", trader_pos.size);
+            trader_pos.size = 0.0; 
+            trader_pos.total_cost_basis = 0.0; 
         }
+    }
+    println!("handle_sell: Finished user_positions update scope.");
 
-        // --- Update Realized PNL ---
-        if realized_pnl_for_trade.abs() > EPSILON {
-            let mut total_pnl = state.user_realized_pnl.entry(user_id.to_string()).or_insert(0.0);
-            *total_pnl += realized_pnl_for_trade;
-            final_total_realized_pnl = *total_pnl;
-         } else {
-            final_total_realized_pnl = *state.user_realized_pnl.get(user_id).unwrap().value();
-        }
+    {
+         println!("handle_sell: Updating user_realized_pnl...");
+        state.user_realized_pnl.entry(trader_user_id.to_string()) 
+            .and_modify(|rpnl| *rpnl += trader_rpnl_change)
+            .or_insert(trader_rpnl_change);
+        println!("handle_sell: user_realized_pnl updated by {:.4}.", trader_rpnl_change);
+    }
+    println!("handle_sell: Finished user_realized_pnl update scope.");
 
-        // --- Update Stored Exposure ---
-        let mut exposure_entry = state.user_exposure.entry(user_id.to_string()).or_insert(0.0);
-        *exposure_entry += delta_exposure; // Apply calculated change
-         // Ensure exposure doesn't go negative due to float issues
-        if *exposure_entry < 0.0 { *exposure_entry = 0.0; }
-        final_exposure = *exposure_entry;
+    // Update Trader Exposure
+    let new_total_exposure = calculate_total_exposure(trader_user_id, state);
+    state.user_exposure.insert(trader_user_id.to_string(), new_total_exposure);
+    println!("handle_sell: Updated trader exposure to {:.4}.", new_total_exposure);
 
-        // --- Cleanup near-zero positions ---
-         if user_position.size.abs() < EPSILON {
-             println!("   -> Position size is near zero ({:.8}) after trade, resetting basis and size.", user_position.size);
-             user_position.size = 0.0;
-             user_position.total_cost_basis = 0.0;
-             // If position is zero, exposure should ideally be zero.
-             // Check if stored exposure matches calculated exposure after cleanup?
-             // let calculated_exp_after_cleanup = calculate_user_exposure(user_id, state); // If helper existed
-             // if (*exposure_entry - calculated_exp_after_cleanup).abs() > EPSILON * 100.0 { ... log warning ... }
-         }
+    println!("handle_sell: Updating liquidated users (if any)...");
+    for (liquidated_user_id, forced_trade_pnl) in &trade_result.liquidated_users {
+        affected_user_ids.insert(liquidated_user_id.clone());
+        let mut liq_pos_removed = false;
+        if let Some(mut liq_pos_map) = state.user_positions.get_mut(liquidated_user_id) {
+             if liq_pos_map.remove(&post_id).is_some() { liq_pos_removed = true; println!("     - Removed liq position for post {}", post_id); } 
+        } 
+        if liq_pos_removed { 
+            state.user_realized_pnl.entry(liquidated_user_id.clone())
+                .and_modify(|rpnl| *rpnl += forced_trade_pnl)
+                .or_insert(*forced_trade_pnl); 
+            println!("     - Updated liq RPnL by {:.4}", forced_trade_pnl);
+        } 
+        state.user_exposure.entry(liquidated_user_id.clone()).and_modify(|exp| *exp = 0.0).or_insert(0.0);
+        println!("     - Reset liq exposure for user {}", liquidated_user_id);
+    }
+    println!("handle_sell: Finished updating liquidated users.");
 
-        final_position = user_position.clone();
-    } // Mutable references are dropped here
-
-    // --- Log results ---
-    let current_balance_for_log = state.user_balances.get(user_id).map_or(0.0, |v| *v.value());
-
-    // Updated log message
-     println!(
-        "-> Sell OK (Qty: {:.6}, Proceeds: {:.6}): Post {} (Supply: {:.6}, Prc: {:.6}), User {} (Pos: {:.6}, RPnlTrade: {:.6}, Bal: {:.6}, TotRPnl: {:.6}, FinalExp: {:.6})",
-        quantity, trade_proceeds, post_id, new_supply, final_price, user_id, final_position.size,
-        realized_pnl_for_trade,
-        current_balance_for_log, final_total_realized_pnl, final_exposure
+    // --- Phase 4: Post-Trade Updates & Broadcasts --- 
+    println!(
+        "-> Sell OK (Qty: {:.6}, EffProceeds: {:.6}): Post {} -> Supply: {:.6}, Prc: {:.6}. Liqs: {}",
+        quantity, -trade_result.effective_cost, 
+        post_id, final_supply, final_price, trade_result.liquidated_users.len()
     );
 
-    // --- Send Granular Updates (Optional - covered by send_user_sync_update below) ---
-    // send_to_client(client_id, ServerMessage::BalanceUpdate { balance: final_balance }, state).await; // Balance doesn't change per trade
-    // send_to_client(client_id, ServerMessage::RealizedPnlUpdate { total_realized_pnl: final_total_realized_pnl }, state).await;
-    // send_to_client(client_id, ServerMessage::ExposureUpdate { exposure: final_exposure }, state).await;
-    // send_to_client(client_id, ServerMessage::PositionUpdate {
-    //     post_id, size: final_position.size,
-    //     average_price: calculate_average_price(&final_position),
-    //     calculate_unrealized_pnl(&final_position, final_price)
-    //  }, state).await;
-    // let equity = current_balance_for_log + final_total_realized_pnl + calculate_total_unrealized_pnl(user_id, state);
-    // send_to_client(client_id, ServerMessage::EquityUpdate { equity }, state).await;
+    println!("handle_sell: Broadcasting market updates...");
+    broadcast_market_and_position_updates(post_id, final_price, final_supply, client_id, state).await;
+    println!("handle_sell: Returned from market update broadcast.");
 
-    // Remove old margin update
-    // let new_margin = calculate_user_margin(user_id, state);
-    // send_to_client(client_id, ServerMessage::MarginUpdate { margin: new_margin }, state).await;
+    // Send UserSync Updates
+    println!("handle_sell: Preparing UserSync client map...");
+    let client_map: HashMap<String, Uuid> = state.clients.iter()
+        .map(|entry| (entry.value().user_id.clone(), *entry.key()))
+        .collect();
+    println!("handle_sell: Client map created (size: {}). Sending UserSync updates...", client_map.len());
 
-    // --- Broadcast Market and Position Updates (Needs review) ---
-    broadcast_market_and_position_updates(post_id, final_price, new_supply, client_id, state).await;
+    for user_id in affected_user_ids {
+        if let Some(affected_client_id) = client_map.get(&user_id) {
+            println!("   - Sending UserSync update to affected User {} (Client {})", user_id, affected_client_id);
+            let state_clone = state.clone();
+            let user_id_clone = user_id.clone();
+            let affected_client_id_clone = *affected_client_id;
+            // Add a small delay before accessing state again in send_user_sync_update
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+            send_user_sync_update(&user_id_clone, affected_client_id_clone, &state_clone).await;
+            println!("   - Returned from send_user_sync_update for User {} (Client {})", user_id, affected_client_id);
+        } else {
+             println!("   - Skipping UserSync update for User {} (offline?)", user_id);
+        }
+    }
+    println!("handle_sell: Finished sending UserSync updates loop. Returning from handle_sell normally.");
+}
 
-    // Note: send_user_sync_update will be called after this function returns in handle_client_message
+// Function to recalculate and update liquidation thresholds for a post
+async fn update_liquidation_thresholds(post_id: Uuid, state: &AppState) {
+    let start_time = Instant::now();
+    println!("--- Entering update_liquidation_thresholds for Post: {} ---", post_id);
+
+    // Temporary map to store user-specific thresholds before aggregating
+    // Key: s_liq (as OrderedFloat), Value: Vec<(cost_unwind, size_unwind, user_id)>
+    let mut aggregated_thresholds: BTreeMap<OrderedFloat<f64>, Vec<(f64, f64, String)>> = BTreeMap::new();
+
+    println!("update_liquidation_thresholds: Starting Phase 1 - Iterating user positions...");
+    // --- Phase 1: Calculate individual user liquidation points & data ---
+    for user_entry in state.user_positions.iter() {
+        let user_id = user_entry.key();
+        println!("update_liquidation_thresholds: Checking user: {}", user_id);
+        if let Some(position) = user_entry.value().get(&post_id) {
+            println!("update_liquidation_thresholds: Found position for user {} on post {}: Size={:.4}", user_id, post_id, position.size);
+            if position.size.abs() < EPSILON { continue; }
+
+            println!("update_liquidation_thresholds: Calculating for user {}: Getting balance/rpnl...", user_id);
+            let balance = state.user_balances.get(user_id).map_or(0.0, |v| *v.value());
+            let rpnl = state.user_realized_pnl.get(user_id).map_or(0.0, |v| *v.value());
+            println!("update_liquidation_thresholds: User {}: Bal={:.4}, RPnl={:.4}. Getting market price...", user_id, balance, rpnl);
+            let current_market_price = state.posts.get(&post_id)
+                .map_or(0.0, |p| p.value().price.unwrap_or(0.0)); // Fixed: Use price, unwrap Option
+            println!("update_liquidation_thresholds: User {}: MarketPrice={:.4}. Calculating avg_price...", user_id, current_market_price);
+
+            let avg_price = calculate_average_price(&position);
+            println!("update_liquidation_thresholds: User {}: AvgPrice={:.4}. Calculating uRPnL...", user_id, avg_price);
+            let total_unrealized_pnl = (current_market_price - avg_price) * position.size;
+            println!("update_liquidation_thresholds: User {}: uRPnL={:.4}. Calculating liquidation supply...", user_id, total_unrealized_pnl);
+
+            if let Some(s_liq) = calculate_liquidation_supply(balance, rpnl, position.size, avg_price) {
+                println!("update_liquidation_thresholds: User {}: Calculated s_liq = {:.4}. Calculating unwind...", user_id, s_liq);
+                let forced_trade_size = -position.size;
+                let s_liq_after_unwind = s_liq + forced_trade_size;
+                let cost_unwind = calculate_smooth_cost(s_liq, s_liq_after_unwind);
+                println!("update_liquidation_thresholds: User {}: ForcedSize={:.4}, s_liq_after={:.4}, CostUnwind={:.4}. Adding to map...", user_id, forced_trade_size, s_liq_after_unwind, cost_unwind);
+
+                // Add this user's liquidation data to the aggregation map
+                let supply_key = OrderedFloat(s_liq);
+                aggregated_thresholds.entry(supply_key)
+                    .or_default() // Get Vec or create new one
+                    .push((cost_unwind, forced_trade_size, user_id.clone()));
+                println!("update_liquidation_thresholds: User {}: Added entry for s_liq = {:.4}.", user_id, s_liq);
+            } else {
+                println!("update_liquidation_thresholds: User {}: No liquidation supply calculated.", user_id);
+            }
+        } else {
+            println!("update_liquidation_thresholds: User {} has no position on post {}.", user_id, post_id);
+        }
+    }
+    println!("update_liquidation_thresholds: Finished Phase 1. Starting Phase 2 - Updating state...");
+
+    // --- Phase 2: Update state --- 
+    // Remove thresholds where the net effect is negligible (optional optimization)
+     aggregated_thresholds.retain(|_, entries| {
+         entries.iter().any(|(cost, size, _)| cost.abs() > EPSILON || size.abs() > EPSILON)
+     });
+    println!("update_liquidation_thresholds: Retained {} aggregated thresholds.", aggregated_thresholds.len());
+
+    // Insert the newly calculated map into the shared state
+    state.liquidation_thresholds.insert(post_id, aggregated_thresholds);
+    println!("update_liquidation_thresholds: Inserted aggregated map into state.liquidation_thresholds.");
+
+    let duration = start_time.elapsed();
+     println!("--- Finished Updating Liquidation Thresholds for Post: {}. Took {:?}. Entries: {} ---", post_id, duration, state.liquidation_thresholds.get(&post_id).map_or(0, |m| m.len()));
 } 
+
+

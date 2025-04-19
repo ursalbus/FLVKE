@@ -22,12 +22,15 @@ class TimelineState extends ChangeNotifier {
        _posts.sort((a, b) => b.timestamp.compareTo(a.timestamp)); // Sort newest first
       _isLoading = false;
       print("TimelineState: Received initial state with ${_posts.length} posts.");
+      // Add log before notifyListeners
+      print("TimelineState: Updated _posts count: ${_posts.length}, isLoading: $_isLoading. Preparing to notify listeners.");
       changed = true;
     } else if (message is NewPostMessage) {
        // Avoid duplicates if message somehow arrives multiple times
        if (!_posts.any((p) => p.id == message.post.id)) {
           _posts.insert(0, message.post); // Add new post to the beginning
            print("TimelineState: Added new post ${message.post.id}.");
+           print("TimelineState: _posts count: ${_posts.length}. Preparing to notify listeners.");
            changed = true;
        }
     } else if (message is MarketUpdateMessage) {
@@ -46,6 +49,7 @@ class TimelineState extends ChangeNotifier {
                     supply: message.supply, // Update supply
                 );
                 print("TimelineState: Updated post ${message.postId} - Price: ${message.price}, Supply: ${message.supply}");
+                 print("TimelineState: Post updated at index $index. Preparing to notify listeners.");
                 changed = true;
             }
         } else {
@@ -58,6 +62,7 @@ class TimelineState extends ChangeNotifier {
           _error = message.message;
           // Optionally set loading to false if an error occurs during loading
           if (_isLoading) _isLoading = false;
+           print("TimelineState: Error set: $_error. Preparing to notify listeners.");
           changed = true;
        }
     } else if (message is UnknownMessage) {
@@ -65,11 +70,13 @@ class TimelineState extends ChangeNotifier {
         final errorMsg = "Received unknown message type: ${message.type}";
          if (_error != errorMsg) { // Only update if error message is different
              _error = errorMsg;
+             print("TimelineState: Unknown message error set: $_error. Preparing to notify listeners.");
              changed = true;
          }
     }
 
     if (changed) {
+        print("TimelineState: Calling notifyListeners() due to state change.");
         notifyListeners(); // Update UI
     }
   }
@@ -78,6 +85,7 @@ class TimelineState extends ChangeNotifier {
       if (_isLoading != loading) {
          _isLoading = loading;
          if (loading) _error = null; // Clear error when starting to load
+         print("TimelineState: setLoading($loading) called. Notifying listeners.");
          notifyListeners();
       }
    }
@@ -86,6 +94,7 @@ class TimelineState extends ChangeNotifier {
       if (_error != errorMsg) {
          _error = errorMsg;
          if (errorMsg != null) _isLoading = false; // Stop loading if error occurs
+         print("TimelineState: setError('$errorMsg') called. Notifying listeners.");
          notifyListeners();
       }
    }

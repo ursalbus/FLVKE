@@ -35,8 +35,9 @@ fn integral_neg_to_zero(s: f64) -> f64 {
     }
 }
 
-// Calculate the cost (definite integral) of changing supply from s1 to s2
-pub fn calculate_cost(s1: f64, s2: f64) -> f64 {
+// Calculate the base cost (definite integral) using the smooth curve P(s)
+// from supply s1 to s2.
+pub fn calculate_smooth_cost(s1: f64, s2: f64) -> f64 {
     if s1.is_nan() || s1.is_infinite() || s2.is_nan() || s2.is_infinite() {
         return f64::NAN;
     }

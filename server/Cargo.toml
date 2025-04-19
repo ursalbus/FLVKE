@@ -14,4 +14,6 @@ dotenvy = "0.15"
 chrono = { version = "0.4", features = ["serde"] } # Serde feature for JWT claims
 uuid = { version = "1", features = ["v4", "serde"] } # v4 for random UUIDs, serde feature
 dashmap = "5.5"
-tokio-stream = "0.1" 
+tokio-stream = "0.1"
+ordered-float = "4.2.0"
+num-traits = "0.2.18" 

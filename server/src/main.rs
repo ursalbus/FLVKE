@@ -19,7 +19,7 @@ use warp::{
 // Use items from modules
 use auth::with_auth;
 use errors::handle_rejection;
-use state::{AppState, Clients, Posts, UserBalances, UserPositions, UserRealizedPnl, UserExposure};
+use state::{AppState, Clients, Posts, UserBalances, UserPositions, UserRealizedPnl, UserExposure, LiquidationThresholds};
 use websocket::handle_connection;
 
 #[tokio::main]
@@ -41,6 +41,7 @@ async fn main() {
         user_realized_pnl: UserRealizedPnl::default(),
         user_exposure: UserExposure::default(),
         jwt_secret: Arc::new(jwt_secret),
+        liquidation_thresholds: LiquidationThresholds::default(),
     };
 
     println!("JWT Secret loaded.");

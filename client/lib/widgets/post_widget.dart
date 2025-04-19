@@ -33,20 +33,21 @@ class _PostWidgetState extends State<PostWidget> {
   String? _buyDisabledReason;
   String? _sellDisabledReason;
 
-  // Hold references to states to remove listeners in dispose
-  late BalanceState _balanceState;
-  late PositionState _positionState;
+  // Hold references to states removed from listeners
+  // late BalanceState _balanceState;
+  // late PositionState _positionState;
 
   @override
   void initState() {
     super.initState();
-    // Get state references (don't listen here, listen in didChangeDependencies or use context.read)
-    _balanceState = Provider.of<BalanceState>(context, listen: false);
-    _positionState = Provider.of<PositionState>(context, listen: false);
+    // Get state references (don't listen here)
+    // _balanceState = Provider.of<BalanceState>(context, listen: false);
+    // _positionState = Provider.of<PositionState>(context, listen: false);
 
-    _quantityController.addListener(_updateChecks);
-    _balanceState.addListener(_updateChecks);
-    _positionState.addListener(_updateChecks);
+    _quantityController.addListener(_updateChecks); // Keep listener for quantity input
+    // Remove listeners for BalanceState and PositionState
+    // _balanceState.addListener(_updateChecks);
+    // _positionState.addListener(_updateChecks);
 
     // Calculate initial costs and checks after the first frame
     WidgetsBinding.instance.addPostFrameCallback((_) => _updateChecks());
@@ -55,8 +56,9 @@ class _PostWidgetState extends State<PostWidget> {
   @override
   void dispose() {
     _quantityController.removeListener(_updateChecks);
-    _balanceState.removeListener(_updateChecks);
-    _positionState.removeListener(_updateChecks);
+    // Remove listeners for BalanceState and PositionState
+    // _balanceState.removeListener(_updateChecks);
+    // _positionState.removeListener(_updateChecks);
     _quantityController.dispose();
     _quantityFocusNode.dispose();
     super.dispose();

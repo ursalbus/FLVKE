@@ -294,7 +294,15 @@ pub async fn handle_connection(ws: WebSocket, user_id: String, state: AppState) 
             }
         };
 
+        println!(
+            "handle_connection for client_id={}: Received msg: {:?}. Calling handle_client_message...",
+            client_id, msg
+        );
         handle_client_message(client_id, &user_id, msg, &state).await;
+        println!(
+            "handle_connection for client_id={}: Returned from handle_client_message.",
+            client_id
+        );
     }
 
     // --- Cleanup on Disconnect ---

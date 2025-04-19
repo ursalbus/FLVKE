@@ -5,6 +5,7 @@ import 'package:intl/intl.dart'; // For date formatting
 import '../state/auth_state.dart';
 import '../state/timeline_state.dart';
 import '../state/balance_state.dart';
+import '../state/theme_state.dart'; // Import ThemeState
 import '../services/websocket_service.dart';
 import '../widgets/post_widget.dart'; // Import PostWidget
 
@@ -177,6 +178,7 @@ class _TimelinePageState extends State<TimelinePage> {
     final wsStatus = context.watch<WebSocketService>().status; // Watch for UI updates
     final balanceState = context.watch<BalanceState>(); // Watch for balance updates
     final timelineState = context.watch<TimelineState>(); // Watch for posts, loading, errors
+    final themeState = context.watch<ThemeState>(); // Watch ThemeState
 
     // Format currency values
     final numberFormat = NumberFormat.currency(symbol: '\$', decimalDigits: 2);
@@ -192,7 +194,11 @@ class _TimelinePageState extends State<TimelinePage> {
     final exposureRatio = (availableCollateral > 0 && balanceState.exposure >= 0)
         ? (balanceState.exposure / availableCollateral).clamp(0.0, 1.0)
         : 0.0;
-    final exposureColor = exposureRatio > 0.8 ? Colors.orangeAccent : Colors.blueAccent;
+    // Adjust exposure color based on theme
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
+    final exposureColor = exposureRatio > 0.8 
+        ? (isDark ? Colors.orange : Colors.orangeAccent)
+        : (isDark ? Colors.blue : Colors.blueAccent);
 
     // Format the new value
     final availableCollateralFormatted = numberFormat.format(availableCollateral);
@@ -241,6 +247,22 @@ class _TimelinePageState extends State<TimelinePage> {
                padding: const EdgeInsets.symmetric(horizontal: 8.0),
                child: Center(child: Text('WS: ${wsStatus.name}', style: const TextStyle(fontSize: 14))), // Use status name
              ),
+            // Add Theme Toggle Switch
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8.0),
+              child: Switch(
+                value: themeState.isDarkMode,
+                onChanged: (value) {
+                   themeState.toggleTheme();
+                },
+                thumbIcon: MaterialStateProperty.resolveWith<Icon?>((states) {
+                    if (states.contains(MaterialState.selected)) {
+                       return const Icon(Icons.dark_mode, color: Colors.black54);
+                    } 
+                    return const Icon(Icons.light_mode, color: Colors.yellow);
+                 }),
+              ),
+            ),
            IconButton(
              icon: const Icon(Icons.logout),
              tooltip: 'Logout', // Add tooltip
@@ -249,98 +271,89 @@ class _TimelinePageState extends State<TimelinePage> {
                 await authState.signOut();
              },
            ),
-         ],
-      ),
-      body: Column( // Main body structure
-        children: [
-          // Error display area - now uses timelineState directly
-          if (timelineState.error != null)
-            _buildErrorBanner(timelineState.error!),
-
-          // Loading indicator or Post list area
-          Expanded(
-            child: _buildTimelineContent(timelineState),
-          ),
         ],
       ),
-      // Floating action button to create posts
+      body: RefreshIndicator(
+        onRefresh: () async {
+          // Handle refresh: Maybe reconnect WebSocket or request fresh data?
+          print("Pull to refresh triggered.");
+           final token = authState.accessToken;
+           if (token != null && _webSocketService.status != WebSocketStatus.connecting) {
+             _webSocketService.disconnect(); // Disconnect first
+             await Future.delayed(const Duration(milliseconds: 100)); // Small delay
+             _webSocketService.connect(token); // Reconnect
+           } else if (token == null) {
+             print("Cannot refresh: No token");
+             authState.signOut(); // Sign out if token lost
+           }
+        },
+        child: Column(
+          children: [
+            // Display error messages if any
+            if (timelineState.error != null)
+              Padding(
+                padding: const EdgeInsets.all(8.0),
+                child: Container(
+                   color: Colors.red[100],
+                   padding: const EdgeInsets.all(8.0),
+                   child: Row(
+                      children: [
+                        Icon(Icons.error_outline, color: Colors.red[800]),
+                        const SizedBox(width: 8),
+                        Expanded(child: Text(timelineState.error!, style: TextStyle(color: Colors.red[900]))),
+                        IconButton(
+                           icon: Icon(Icons.close, size: 16, color: Colors.red[900]),
+                           onPressed: () => timelineState.setError(null), // Clear error
+                        )
+                      ],
+                   ),
+                ),
+              ),
+            // Display loading indicator
+            if (timelineState.isLoading)
+              const Center(child: Padding(
+                 padding: EdgeInsets.all(16.0),
+                 child: CircularProgressIndicator(),
+              )),
+            // Display timeline posts
+            Expanded(
+              child: ListView.builder(
+                itemCount: timelineState.posts.length,
+                itemBuilder: (context, index) {
+                  final post = timelineState.posts[index];
+                  // Use the PostWidget here
+                  return PostWidget(post: post, key: ValueKey(post.id)); // Use ValueKey for efficient updates
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
       floatingActionButton: FloatingActionButton(
-        onPressed: wsStatus == WebSocketStatus.connected ? _showCreatePostDialog : null,
-        tooltip: 'New Post',
-        backgroundColor: wsStatus == WebSocketStatus.connected
-            ? Theme.of(context).colorScheme.primary
-            : Colors.grey, // Disable visually if not connected
+        onPressed: _showCreatePostDialog,
+        tooltip: 'Create Post',
         child: const Icon(Icons.add),
       ),
     );
   }
 
-  // Helper widget to build styled stat chips for the AppBar
+  // Helper to build styled chips for the AppBar bottom
   Widget _buildStatChip(String label, String value, [Color? valueColor]) {
+    // Use theme context here to ensure colors adapt
+    final theme = Theme.of(context);
+    final defaultColor = theme.appBarTheme.foregroundColor ?? (theme.brightness == Brightness.dark ? Colors.white70 : Colors.black87);
+
      return Chip(
-        padding: const EdgeInsets.symmetric(horizontal: 3.0, vertical: 0.0), // Reduced padding
-        labelPadding: const EdgeInsets.symmetric(horizontal: 3.0), // Reduced padding
-        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-        label: Text(
-          '$label: $value',
-          style: TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.bold,
-              color: valueColor,
-           ),
-        ),
-        backgroundColor: Colors.grey[200],
-        side: BorderSide(color: Colors.grey[400]!),
-     );
-  }
-
-  // Helper to build the error banner
-  Widget _buildErrorBanner(String errorMessage) {
-     return Container(
-         color: Colors.red[100],
-         padding: const EdgeInsets.all(8.0),
-         child: Row(
-           children: [
-              Icon(Icons.error_outline, color: Colors.red[700]),
-              const SizedBox(width: 8),
-              Expanded(child: Text(errorMessage)), // Use the passed message
-           ],
-         ),
-     );
-  }
-
-  // Helper to build the main content area (loading/empty/list)
-  Widget _buildTimelineContent(TimelineState timelineState) {
-     if (timelineState.isLoading) {
-        return const Center(child: CircularProgressIndicator());
-     // Show error here only if not loading and error exists? Or rely on banner?
-     // } else if (timelineState.error != null) {
-     //    return Center(child: Text('Error: ${timelineState.error}')); // Can duplicate banner
-     } else if (timelineState.posts.isEmpty) {
-        return const Center(child: Text('No posts yet. Create one!'));
-     } else {
-        // Display the list of posts
-        return RefreshIndicator( // Add pull-to-refresh
-           onRefresh: () async {
-              // Reconnect or send a refresh request? Currently, reconnects.
-              print("Pull to refresh triggered.");
-              // _webSocketService.disconnect(); // Force disconnect? Risky.
-              // Give some time for potential disconnect message
-              // await Future.delayed(const Duration(milliseconds: 100));
-              _connectWebSocketIfNeeded(); // Attempt connection
-           },
-           child: ListView.builder(
-             // Add keys if needed for performance/state preservation
-             // key: const PageStorageKey<String>('timelineList'),
-             physics: const AlwaysScrollableScrollPhysics(), // Ensure scrollable even with few items for RefreshIndicator
-             itemCount: timelineState.posts.length,
-             itemBuilder: (context, index) {
-                final post = timelineState.posts[index];
-                // Use ValueKey for better list performance if post IDs are stable
-                return PostWidget(key: ValueKey(post.id), post: post);
-             },
-           ),
-        );
-     }
+      label: Text('$label: $value'),
+      labelStyle: TextStyle(
+         fontSize: 11, // Smaller font size
+         color: valueColor ?? defaultColor,
+      ),
+      backgroundColor: theme.appBarTheme.backgroundColor?.withOpacity(0.1), // Subtle background
+      padding: const EdgeInsets.symmetric(horizontal: 5.0, vertical: 0), // Reduced padding
+      visualDensity: VisualDensity.compact, // Make chip smaller
+      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap, // Reduce tap area
+      side: BorderSide.none, // Remove border
+    );
   }
 } 

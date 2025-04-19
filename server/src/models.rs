@@ -34,6 +34,20 @@ pub struct Post {
     pub supply: f64,
 }
 
+// Ensure Default implementation reflects the current fields
+impl Default for Post {
+    fn default() -> Self {
+        Post {
+            id: Uuid::new_v4(), // Default ID, might be overwritten
+            user_id: String::new(),
+            content: String::new(),
+            timestamp: Utc::now(),
+            price: Some(1.0), // Default price for supply 0
+            supply: 0.0,
+        }
+    }
+}
+
 // Holds the details of a user's position in a specific post
 #[derive(Debug, Clone, Default)]
 pub struct UserPositionDetail {
