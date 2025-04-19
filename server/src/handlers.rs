@@ -456,14 +456,6 @@ async fn handle_sell(
         return;
     }
 
-    let current_position_size = state.user_positions.get(trader_user_id)
-        .and_then(|m| m.get(&post_id).map(|p| p.size))
-        .unwrap_or(0.0);
-    if current_position_size < quantity - EPSILON { // Selling more than held long
-        send_to_client(client_id, ServerMessage::Error { message: format!("Insufficient position to sell {:.6}. Held: {:.6}", quantity, current_position_size) }, state).await; 
-        return;
-    }
-
     // --- Phase 3: Atomic State Updates (similar scoping as handle_buy) --- 
     let mut affected_user_ids = HashSet::new();
     affected_user_ids.insert(trader_user_id.to_string());
