@@ -22,10 +22,10 @@ class PositionState extends ChangeNotifier {
 
     if (message is UserSyncMessage) {
        final newPositions = { for (var p in message.positions) p.postId : p };
-       // Log the received positions including liquidationSupply
+       // Log the received positions including liquidationPrice
        print("PositionState: Received UserSync with ${newPositions.length} positions:");
        for (final pos in newPositions.values) {
-           print("  - Post ${pos.postId}: Size=${pos.size}, AvgPrc=${pos.averagePrice}, uPnL=${pos.unrealizedPnl}, LiqSupply=${pos.liquidationSupply}");
+           print("  - Post ${pos.postId}: Size=${pos.size}, AvgPrc=${pos.averagePrice}, uPnL=${pos.unrealizedPnl}, LiqPrice=${pos.liquidationPrice}");
        }
 
        // Always update the position map on UserSync, as it represents the full state.

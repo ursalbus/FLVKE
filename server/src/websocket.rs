@@ -8,8 +8,8 @@ use super::state::AppState;
 use super::models::{Client, ServerMessage, PositionDetail};
 use super::constants::{INITIAL_BALANCE, EPSILON};
 use super::bonding_curve::get_price;
-use super::calculations::{calculate_average_price, calculate_unrealized_pnl, calculate_liquidation_supply};
-use super::handlers::{calculate_total_unrealized_pnl, handle_client_message};
+use super::calculations::{calculate_average_price, calculate_unrealized_pnl, calculate_liquidation_price};
+use super::handlers::{calculate_total_unrealized_pnl, handle_client_message, send_user_sync_update};
 
 // --- WebSocket Handling ---
 
@@ -95,12 +95,14 @@ pub async fn broadcast_market_and_position_updates(
     state: &AppState,
 ) {
     // 1. Broadcast the general market update to everyone
+    println!("broadcast_market_and_position_updates: Broadcasting MarketUpdate...");
     let market_update_msg = ServerMessage::MarketUpdate {
         post_id,
         price: new_price,
         supply: new_supply,
     };
     broadcast_message(market_update_msg, state).await;
+    println!("broadcast_market_and_position_updates: Finished MarketUpdate broadcast. Iterating clients for PnL/Equity...");
 
     // 2. Iterate through all ACTIVE clients to potentially send PNL and Equity updates
     for client_entry in state.clients.iter() {
@@ -108,8 +110,10 @@ pub async fn broadcast_market_and_position_updates(
         let client_info = client_entry.value();
         let user_id = &client_info.user_id;
 
+        println!("broadcast_market_and_position_updates: Checking client {} (User {})", current_client_id, user_id);
         // Skip the client who initiated this trade
         if current_client_id == trading_client_id {
+             println!("broadcast_market_and_position_updates: Skipping trading client {}", current_client_id);
             continue;
         }
 
@@ -118,30 +122,37 @@ pub async fn broadcast_market_and_position_updates(
         // Check if this *other* user has a position in the updated post
          if let Some(user_positions_map) = state.user_positions.get(user_id) {
              if let Some(position) = user_positions_map.get(&post_id) {
-                 // Only update if position exists and is non-zero
+                 println!("broadcast_market_and_position_updates: User {} has position in post {}. Size={:.4}", user_id, post_id, position.size);
+                 // Only process if position exists and is non-zero (PnL change matters)
                  if position.size.abs() > EPSILON { 
-                     let avg_price = calculate_average_price(&position);
-                     let updated_unrealized_pnl = calculate_unrealized_pnl(&position, new_price);
-
-                     let position_update_msg = ServerMessage::PositionUpdate {
-                         post_id,
-                         size: position.size,
-                         average_price: avg_price.abs(),
-                         unrealized_pnl: updated_unrealized_pnl,
-                     };
+                     println!("broadcast_market_and_position_updates: Position size non-zero. Calculating updates for user {}", user_id);
+                     // We need to send the full UserSync to include the updated liq price
+                     // (since PositionUpdate doesn't currently support it)
+                     // The UserSync calculation automatically handles getting the latest data
                      println!(
-                         "   -> Sending Position update for Post {} to OTHER User {} ({}): AvgPrc: {:.4}, URPnl {:.4}",
-                         post_id, user_id, current_client_id, avg_price.abs(), updated_unrealized_pnl
+                         "   -> Sending UserSync instead of PositionUpdate for Post {} to OTHER User {} ({}).",
+                         post_id, user_id, current_client_id
                      );
-                     send_to_client(current_client_id, position_update_msg, state).await;
-                     affected_by_price_change = true;
+                     // Call send_user_sync_update directly
+                     send_user_sync_update(user_id, current_client_id, state).await;
+                     println!("   -> Returned from send_user_sync_update call.");
+                     affected_by_price_change = true; // Mark that PnL potentially changed
+                 } else {
+                     println!("broadcast_market_and_position_updates: Position size near zero for user {}, skipping PnL update.", user_id);
                  }
+             } else {
+                 println!("broadcast_market_and_position_updates: User {} has no position in post {}, skipping PnL update.", user_id, post_id);
              }
+         } else {
+              println!("broadcast_market_and_position_updates: User {} has no position map, skipping PnL update.", user_id);
          }
 
         // If the user's PNL for this post changed, their overall Equity also changed.
         // Send EquityUpdate. Exposure doesn't change from market moves, only trades.
+        // This might be redundant if we send UserSync above, but let's keep it for now
+        // as UserSync primarily updates the *target* user of the sync.
         if affected_by_price_change {
+            println!("broadcast_market_and_position_updates: User {} was affected by price change, sending EquityUpdate.", user_id);
             // Recalculate total equity for this user
             let balance = state.user_balances.get(user_id).map_or(INITIAL_BALANCE, |b| *b.value());
             let realized_pnl = state.user_realized_pnl.get(user_id).map_or(0.0, |pnl| *pnl.value());
@@ -153,8 +164,11 @@ pub async fn broadcast_market_and_position_updates(
                  user_id, current_client_id, equity
             );
             send_to_client(current_client_id, ServerMessage::EquityUpdate { equity }, state).await;
+        } else {
+             println!("broadcast_market_and_position_updates: User {} not affected by price change, skipping EquityUpdate.", user_id);
         }
     }
+     println!("broadcast_market_and_position_updates: Finished iterating clients.");
 }
 
 pub async fn handle_connection(ws: WebSocket, user_id: String, state: AppState) {
@@ -223,8 +237,8 @@ pub async fn handle_connection(ws: WebSocket, user_id: String, state: AppState) 
                         let avg_price = calculate_average_price(position);
                         let unrealized_pnl = calculate_unrealized_pnl(position, current_market_price);
                         
-                        // Calculate liquidation supply here too
-                        let liquidation_supply = calculate_liquidation_supply(
+                        // Calculate liquidation price here too
+                        let liquidation_price = calculate_liquidation_price(
                             user_balance, // Use fetched balance
                             total_realized_pnl, // Use fetched rpnl
                             position.size, 
@@ -236,7 +250,7 @@ pub async fn handle_connection(ws: WebSocket, user_id: String, state: AppState) 
                             size: position.size,
                             average_price: avg_price.abs(),
                             unrealized_pnl: unrealized_pnl,
-                            liquidation_supply, // Add field
+                            liquidation_price, // Add field
                         }
                     })
                 })

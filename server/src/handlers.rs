@@ -10,7 +10,7 @@ use super::models::{ClientMessage, ServerMessage, Post, UserPositionDetail};
 use super::constants::{EPSILON, INITIAL_BALANCE};
 use super::bonding_curve::{get_price, calculate_smooth_cost};
 use super::calculations::{
-    calculate_average_price, calculate_unrealized_pnl, calculate_liquidation_supply,
+    calculate_average_price, calculate_unrealized_pnl, calculate_liquidation_price,
     EffectiveTradeResult, calculate_effective_cost_and_final_supply
 };
 use super::websocket::{send_to_client, broadcast_message, broadcast_market_and_position_updates};
@@ -57,7 +57,7 @@ pub fn calculate_total_exposure(user_id: &str, state: &AppState) -> f64 {
 }
 
 // Helper function to send a comprehensive user state update
-async fn send_user_sync_update(user_id: &str, client_id: Uuid, state: &AppState) {
+pub async fn send_user_sync_update(user_id: &str, client_id: Uuid, state: &AppState) {
     println!("--- Entering send_user_sync_update for User {} (Client {}) ---", user_id, client_id);
     // Fetch potentially updated values
     println!("send_user_sync_update: Fetching balance...");
@@ -136,24 +136,24 @@ async fn send_user_sync_update(user_id: &str, client_id: Uuid, state: &AppState)
              let avg_price = calculate_average_price(&position_value);
              if position_value.size.abs() > EPSILON {
                 let unrealized_pnl = calculate_unrealized_pnl(&position_value, current_market_price);
-                println!("send_user_sync_update: Post {}, AvgPrc={:.4}, uPnL={:.4}. Calculating liq supply...", post_id, avg_price, unrealized_pnl);
+                println!("send_user_sync_update: Post {}, AvgPrc={:.4}, uPnL={:.4}. Calculating liq price...", post_id, avg_price, unrealized_pnl);
                     total_unrealized_pnl += unrealized_pnl;
 
-                // Calculate liquidation supply for this position
-                let liquidation_supply = calculate_liquidation_supply(
+                // Calculate liquidation price for this position
+                let liquidation_price = calculate_liquidation_price(
                     user_balance_for_liq, 
                     user_rpnl_for_liq, 
                     position_value.size, 
                     avg_price
                 );
-                println!("send_user_sync_update: Post {}, LiqSupply={:?}. Adding detail.", post_id, liquidation_supply);
+                println!("send_user_sync_update: Post {}, LiqPrice={:?}. Adding detail.", post_id, liquidation_price);
 
                     position_details.push(super::models::PositionDetail {
                         post_id,
                     size: position_value.size,
                     average_price: avg_price,
                         unrealized_pnl,
-                    liquidation_supply, // Add the calculated value
+                    liquidation_price, // Pass the calculated price
                     });
              } else {
                 println!("send_user_sync_update: Post {}, Size near zero, skipping detail.", post_id);
@@ -606,9 +606,9 @@ async fn update_liquidation_thresholds(post_id: Uuid, state: &AppState) {
             let avg_price = calculate_average_price(&position);
             println!("update_liquidation_thresholds: User {}: AvgPrice={:.4}. Calculating uRPnL...", user_id, avg_price);
             let total_unrealized_pnl = (current_market_price - avg_price) * position.size;
-            println!("update_liquidation_thresholds: User {}: uRPnL={:.4}. Calculating liquidation supply...", user_id, total_unrealized_pnl);
+            println!("update_liquidation_thresholds: User {}: uRPnL={:.4}. Calculating liquidation price...", user_id, total_unrealized_pnl);
 
-            if let Some(s_liq) = calculate_liquidation_supply(balance, rpnl, position.size, avg_price) {
+            if let Some(s_liq) = calculate_liquidation_price(balance, rpnl, position.size, avg_price) {
                 println!("update_liquidation_thresholds: User {}: Calculated s_liq = {:.4}. Calculating unwind...", user_id, s_liq);
                 let forced_trade_size = -position.size;
                 let s_liq_after_unwind = s_liq + forced_trade_size;
@@ -622,7 +622,7 @@ async fn update_liquidation_thresholds(post_id: Uuid, state: &AppState) {
                     .push((cost_unwind, forced_trade_size, user_id.clone()));
                 println!("update_liquidation_thresholds: User {}: Added entry for s_liq = {:.4}.", user_id, s_liq);
             } else {
-                println!("update_liquidation_thresholds: User {}: No liquidation supply calculated.", user_id);
+                println!("update_liquidation_thresholds: User {}: No liquidation price calculated.", user_id);
             }
          } else {
             println!("update_liquidation_thresholds: User {} has no position on post {}.", user_id, post_id);
@@ -643,6 +643,30 @@ async fn update_liquidation_thresholds(post_id: Uuid, state: &AppState) {
 
     let duration = start_time.elapsed();
      println!("--- Finished Updating Liquidation Thresholds for Post: {}. Took {:?}. Entries: {} ---", post_id, duration, state.liquidation_thresholds.get(&post_id).map_or(0, |m| m.len()));
+} 
+
+// --- Margin Calculation Helper ---
+
+pub fn calculate_user_margin(user_id: &str, state: &AppState) -> f64 {
+    let balance = state.user_balances.get(user_id).map_or(INITIAL_BALANCE, |b| *b.value());
+    let mut total_unrealized_pnl = 0.0;
+
+    if let Some(user_positions_map) = state.user_positions.get(user_id) {
+        for position_entry in user_positions_map.iter() {
+            let post_id = *position_entry.key();
+            let position = position_entry.value();
+
+            if position.size.abs() > EPSILON {
+                if let Some(market_post) = state.posts.get(&post_id) {
+                    let current_market_price = market_post.price.unwrap_or_else(|| get_price(market_post.supply));
+                    total_unrealized_pnl += calculate_unrealized_pnl(position, current_market_price);
+                } else {
+                    eprintln!("Warning: Post {} not found while calculating margin for user {}", post_id, user_id);
+                }
+            }
+        }
+    }
+    balance + total_unrealized_pnl
 } 
 
 

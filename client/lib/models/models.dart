@@ -43,30 +43,30 @@ class PositionDetail {
   final double size; // <-- Changed to double
   final double averagePrice;
   final double unrealizedPnl;
-  final double? liquidationSupply; // Make optional
+  final double? liquidationPrice; // Renamed field
 
   const PositionDetail({
     required this.postId,
     required this.size,
     required this.averagePrice,
     required this.unrealizedPnl,
-    this.liquidationSupply, // Add to constructor
+    this.liquidationPrice, // Updated constructor parameter
   });
 
   factory PositionDetail.fromJson(Map<String, dynamic> json) {
     // Log the incoming value for debugging
-    final rawLiqSupply = json['liquidation_supply'];
-    print("PositionDetail.fromJson: Parsing post ${json['post_id']}, liq_supply raw value: $rawLiqSupply");
+    final rawLiqPrice = json['liquidation_price']; // Use new field name
+    print("PositionDetail.fromJson: Parsing post ${json['post_id']}, liquidation_price raw value: $rawLiqPrice");
 
-    final double? parsedLiqSupply = (rawLiqSupply as num?)?.toDouble();
-    print("PositionDetail.fromJson: Parsed post ${json['post_id']}, liq_supply parsed value: $parsedLiqSupply");
+    final double? parsedLiqPrice = (rawLiqPrice as num?)?.toDouble();
+    print("PositionDetail.fromJson: Parsed post ${json['post_id']}, liquidation_price parsed value: $parsedLiqPrice");
 
     return PositionDetail(
       postId: json['post_id'] as String,
-      size: (json['size'] as num).toDouble(), // <-- Parse as num -> double
+      size: (json['size'] as num).toDouble(), 
       averagePrice: (json['average_price'] as num).toDouble(),
       unrealizedPnl: (json['unrealized_pnl'] as num).toDouble(),
-      liquidationSupply: parsedLiqSupply, // Use the parsed value
+      liquidationPrice: parsedLiqPrice, // Use the parsed price value
     );
   }
 }

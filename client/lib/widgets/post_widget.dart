@@ -269,9 +269,12 @@ class _PostWidgetState extends State<PostWidget> {
      final formattedPrice = NumberFormat.currency(symbol: r'$', decimalDigits: 4).format(widget.post.price);
      final formattedSupply = widget.post.supply.toStringAsFixed(4);
 
-     // Read position state for display only (don't need to watch if checks done elsewhere)
+     // Read position state for display only
      final positionState = context.read<PositionState>();
      final positionDetail = positionState.positions[widget.post.id];
+
+     // *** Add Log Here ***
+     print("PostWidget build (${widget.post.id}): positionDetail exists = ${positionDetail != null}, liqPrice = ${positionDetail?.liquidationPrice}");
 
     // The actual enabling/disabling logic now relies on state variables
     // _isQuantityValid, _canAffordBuy, _canAffordSell
@@ -303,7 +306,6 @@ class _PostWidgetState extends State<PostWidget> {
             ),
              const SizedBox(height: 8),
              // Display Position Info if it exists
-             // Use EPSILON for floating point comparison
              if (positionDetail != null && positionDetail.size.abs() > EPSILON)
                 _buildPositionInfo(context, positionDetail),
 
@@ -402,15 +404,18 @@ class _PostWidgetState extends State<PostWidget> {
 
   // Helper widget to display position details
   Widget _buildPositionInfo(BuildContext context, PositionDetail positionDetail) {
+      // *** Add Log Here ***
+      print("PostWidget _buildPositionInfo (${positionDetail.postId}): liqPrice = ${positionDetail.liquidationPrice}");
+
       final formattedSize = positionDetail.size.toStringAsFixed(4);
       final formattedAvgPrice = NumberFormat.currency(symbol: r'$', decimalDigits: 4).format(positionDetail.averagePrice.abs());
       final formattedUnrealizedPnl = NumberFormat.currency(symbol: r'$', decimalDigits: 2).format(positionDetail.unrealizedPnl);
       final pnlColor = positionDetail.unrealizedPnl >= 0 ? Colors.green : Colors.red;
 
-      // Format liquidation supply if available
-      String? formattedLiqSupply;
-      if (positionDetail.liquidationSupply != null) {
-          formattedLiqSupply = positionDetail.liquidationSupply!.toStringAsFixed(4);
+      // Format liquidation price if available
+      String? formattedLiqPrice;
+      if (positionDetail.liquidationPrice != null) {
+          formattedLiqPrice = NumberFormat.currency(symbol: r'$', decimalDigits: 4).format(positionDetail.liquidationPrice!);
       }
 
        return Padding(
@@ -427,12 +432,12 @@ class _PostWidgetState extends State<PostWidget> {
                      'Unrealized P&L: $formattedUnrealizedPnl',
                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: pnlColor),
                  ),
-                 // Conditionally display Liquidation Supply
-                 if (formattedLiqSupply != null)
+                 // Conditionally display Liquidation Price
+                 if (formattedLiqPrice != null)
                     Padding(
                       padding: const EdgeInsets.only(top: 2.0), // Add a little space
                       child: Text(
-                        'Liq. Supply: $formattedLiqSupply',
+                        'Liq. Price: $formattedLiqPrice', // Updated Label
                         style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.orange[700]), // Use a distinct color
                       ),
                     ),

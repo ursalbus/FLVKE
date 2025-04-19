@@ -31,64 +31,40 @@ pub fn calculate_unrealized_pnl(
     }
 }
 
-// Calculate the supply level at which a user would be liquidated for a specific post.
+// Calculate the price at which a user would be liquidated for a specific post.
 // Assumes this is the *only* position impacting their equity for simplicity.
 // Returns None if liquidation is impossible (e.g., requires non-positive price).
-pub fn calculate_liquidation_supply(
+pub fn calculate_liquidation_price(
     balance: f64,
     total_realized_pnl: f64,
     position_size: f64,
     average_entry_price: f64,
 ) -> Option<f64> {
-    println!("  calculate_liquidation_supply: Inputs: bal={:.4}, rpnl={:.4}, size={:.4}, avg_prc={:.4}", balance, total_realized_pnl, position_size, average_entry_price);
+    println!("  calculate_liquidation_price: Inputs: bal={:.4}, rpnl={:.4}, size={:.4}, avg_prc={:.4}", balance, total_realized_pnl, position_size, average_entry_price);
     if position_size.abs() < EPSILON {
-        println!("  calculate_liquidation_supply: No position, returning None.");
+        println!("  calculate_liquidation_price: No position, returning None.");
         return None; // No position, no liquidation threshold
     }
 
     let collateral = balance + total_realized_pnl;
-    println!("  calculate_liquidation_supply: Collateral = {:.4}", collateral);
+    println!("  calculate_liquidation_price: Collateral = {:.4}", collateral);
 
-    // Target price P(s_liq) where equity = 0
-    // collateral + (P(s_liq) - average_entry_price) * position_size = 0
-    // P(s_liq) = average_entry_price - collateral / position_size
-    // Avoid division by zero edge case although checked earlier
-    if position_size.abs() < EPSILON { println!("  calculate_liquidation_supply: Position size zero check 2, returning None."); return None; }
+    // Target price P(liq) where equity = 0
+    // collateral + (P(liq) - average_entry_price) * position_size = 0
+    // P(liq) = average_entry_price - collateral / position_size
+    if position_size.abs() < EPSILON { println!("  calculate_liquidation_price: Position size zero check 2, returning None."); return None; }
     let target_price = average_entry_price - collateral / position_size;
-    println!("  calculate_liquidation_supply: Calculated target_price = {:.6}", target_price);
+    println!("  calculate_liquidation_price: Calculated target_price = {:.6}", target_price);
 
     // Price must be positive
     if target_price <= 0.0 + BONDING_CURVE_EPSILON { // Add epsilon for safety
-        println!("  calculate_liquidation_supply: target_price <= 0, returning None.");
-        return None; // Liquidation would require non-positive price, impossible
+        println!("  calculate_liquidation_price: target_price <= 0, returning None.");
+        None // Liquidation would require non-positive price, impossible
+    } else {
+        println!("  calculate_liquidation_price: target_price > 0. Returning Some(target_price).");
+        Some(target_price)
     }
-    println!("  calculate_liquidation_supply: target_price > 0. Proceeding to find supply...");
-
-    // Now find supply 's' such that P(s) = target_price
-    if (target_price - 1.0).abs() < BONDING_CURVE_EPSILON {
-        // Target price is essentially 1.0
-        Some(0.0)
-    } else if target_price > 1.0 {
-        // Positive supply curve: P(s) = 1 + sqrt(s)
-        // sqrt(s) = target_price - 1
-        // s = (target_price - 1)^2
-        let s_liq = (target_price - 1.0).powi(2);
-        // Ensure result is positive as expected
-        if s_liq >= 0.0 { Some(s_liq) } else { Some(0.0) } // Clamp to 0 if float error occurs
-    } else { // target_price < 1.0
-        // Negative supply curve: P(s) = 1 / (1 + sqrt(|s|))
-        // 1 + sqrt(|s|) = 1 / target_price
-        // sqrt(|s|) = (1.0 / target_price) - 1.0
-        // Protect against sqrt of negative if target_price >= 1 due to float error
-        let base = (1.0 / target_price) - 1.0;
-        if base < 0.0 { return Some(0.0); } // Should have been caught by target_price > 1 check
-
-        // |s| = ((1.0 / target_price) - 1.0)^2
-        let s_liq_abs = base.powi(2);
-        let s_liq = -s_liq_abs;
-         // Ensure result is negative as expected
-        if s_liq <= 0.0 { Some(s_liq) } else { Some(0.0) } // Clamp to 0 if float error occurs
-    }
+    // Removed the logic to convert target_price back to supply (s_liq)
 }
 
 // --- Effective Cost Calculation --- 
